@@ -383,6 +383,15 @@ impl super::CommandEncoder {
 
         (t, buffer)
     }
+    pub unsafe fn draw_graph(&mut self) {
+        self.prepare_dispatch([group_count_x, group_count_y, group_count_z]);
+        let cmd_list10: Direct3D12::ID3D12GraphicsCommandList10 =
+            self.list.as_ref().unwrap().cast().unwrap();
+
+        unsafe {
+            cmd_list10.DispatchGraph(group_count_x, group_count_y, group_count_z);
+        }
+    }
 }
 
 impl crate::CommandEncoder for super::CommandEncoder {
@@ -1369,11 +1378,8 @@ impl crate::CommandEncoder for super::CommandEncoder {
         self.prepare_dispatch([group_count_x, group_count_y, group_count_z]);
         let cmd_list6: Direct3D12::ID3D12GraphicsCommandList6 =
             self.list.as_ref().unwrap().cast().unwrap();
-        //let cmd_list10: Direct3D12::ID3D12GraphicsCommandList10 =
-        // self.list.as_ref().unwrap().cast().unwrap();
         unsafe {
             cmd_list6.DispatchMesh(group_count_x, group_count_y, group_count_z);
-            //cmd_list10.DispatchGraph(pdesc);
         }
     }
     unsafe fn draw_indirect(

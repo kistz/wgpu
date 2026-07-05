@@ -337,6 +337,11 @@ impl crate::framework::Example for Example {
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
+            unsafe {
+                encoder.as_hal_mut(|h: Option<wgpu::hal::dx12::CommandEncoder>| unsafe {
+                    h.unwrap().draw_graph()
+                });
+            }
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
