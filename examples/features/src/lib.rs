@@ -38,6 +38,7 @@ pub mod texture_arrays;
 pub mod timestamp_queries;
 pub mod uniform_values;
 pub mod water;
+pub mod work_graphs;
 
 #[cfg(test)]
 fn all_tests() -> Vec<wgpu_test::GpuTestInitializer> {

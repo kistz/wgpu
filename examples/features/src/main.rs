@@ -212,6 +212,12 @@ const EXAMPLES: &[ExampleDesc] = &[
         webgl: false,
         webgpu: false,
     },
+    ExampleDesc {
+        name: "work_graphs",
+        function: wgpu_examples::work_graphs::main,
+        webgl: false,
+        webgpu: false,
+    },
 ];
 
 fn get_example_name() -> Option<String> {
