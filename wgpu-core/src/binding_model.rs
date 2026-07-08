@@ -18,14 +18,16 @@ use serde::Serialize;
 use wgt::error::{ErrorType, WebGpuError};
 
 use crate::{
+    api_log,
     device::{bgl, Device, DeviceError, MissingDownlevelFlags, MissingFeatures},
     id::{BindGroupLayoutId, BufferId, ExternalTextureId, SamplerId, TextureViewId, TlasId},
     init_tracker::{BufferInitTrackerAction, TextureInitTrackerAction},
     pipeline::{ComputePipeline, RenderPipeline},
     resource::{
-        Buffer, DestroyedResourceError, ExternalTexture, InvalidResourceError, Labeled,
-        MissingBufferUsageError, MissingTextureUsageError, RawResourceAccess, ResourceErrorIdent,
-        ResourceState, Sampler, TextureView, Tlas, TrackingData,
+        Buffer, DestroyedResourceError, ExternalTexture, InvalidOrDestroyedResourceError,
+        InvalidResourceError, Labeled, MissingBufferUsageError, MissingTextureUsageError,
+        RawResourceAccess, ResourceErrorIdent, ResourceState, Sampler, TextureView, Tlas,
+        TrackingData,
     },
     resource_log,
     snatch::{SnatchGuard, Snatchable},
@@ -818,7 +820,10 @@ pub struct BindGroupLayout {
 }
 
 impl Drop for BindGroupLayout {
+    #[allow(trivial_casts)]
     fn drop(&mut self) {
+        profiling::scope!("BindGroupLayout::drop");
+        api_log!("BindGroupLayout::drop {:?}", self as *const _);
         #[cfg(feature = "trace")]
         {
             let mut t = self.device.trace.lock();
@@ -895,7 +900,7 @@ impl BindGroupLayout {
         })
     }
 
-    pub(crate) fn invalid(device: &Arc<Device>, label: String) -> Arc<Self> {
+    pub fn invalid(device: &Arc<Device>, label: String) -> Arc<Self> {
         Arc::new(Self {
             state: ResourceState::Invalid,
             device: device.clone(),
@@ -1037,7 +1042,10 @@ pub struct PipelineLayout {
 }
 
 impl Drop for PipelineLayout {
+    #[allow(trivial_casts)]
     fn drop(&mut self) {
+        profiling::scope!("PipelineLayout::drop");
+        api_log!("PipelineLayout::drop {:?}", self as *const _);
         resource_log!("Destroy raw {}", self.error_ident());
         if let ResourceState::Valid(raw) = core::mem::replace(&mut self.raw, ResourceState::Invalid)
         {
@@ -1334,8 +1342,13 @@ pub(crate) struct BindGroupLateBufferBindingInfo {
 }
 
 #[derive(Debug)]
-pub struct BindGroup {
+pub(crate) struct BindGroupState {
     pub(crate) raw: Snatchable<Box<dyn hal::DynBindGroup>>,
+}
+
+#[derive(Debug)]
+pub struct BindGroup {
+    pub(crate) state: ResourceState<BindGroupState>,
     pub(crate) device: Arc<Device>,
     pub(crate) layout: Arc<BindGroupLayout>,
     /// The `label` from the descriptor used to create the resource.
@@ -1352,8 +1365,19 @@ pub struct BindGroup {
 }
 
 impl Drop for BindGroup {
+    #[allow(trivial_casts)]
     fn drop(&mut self) {
-        if let Some(raw) = self.raw.take() {
+        profiling::scope!("BindGroup::drop");
+        api_log!("BindGroup::drop {:?}", self as *const _);
+        #[cfg(feature = "trace")]
+        if let Some(t) = self.device.trace.lock().as_mut() {
+            use crate::device::trace::{to_trace, Action};
+            t.add(Action::DropBindGroup(unsafe { to_trace(self) }));
+        }
+        let ResourceState::Valid(state) = &mut self.state else {
+            return;
+        };
+        if let Some(raw) = state.raw.take() {
             resource_log!("Destroy raw {}", self.error_ident());
             unsafe {
                 self.device.raw().destroy_bind_group(raw);
@@ -1366,7 +1390,7 @@ impl BindGroup {
     pub(crate) fn try_raw<'a>(
         &'a self,
         guard: &'a SnatchGuard,
-    ) -> Result<&'a dyn hal::DynBindGroup, DestroyedResourceError> {
+    ) -> Result<&'a dyn hal::DynBindGroup, InvalidOrDestroyedResourceError> {
         for buffer in self.used.buffers.used_resources() {
             buffer.try_raw(guard)?;
         }
@@ -1374,10 +1398,41 @@ impl BindGroup {
             texture.try_raw(guard)?;
         }
 
-        self.raw
+        self.state()?
+            .raw
             .get(guard)
             .map(|raw| raw.as_ref())
-            .ok_or_else(|| DestroyedResourceError(self.error_ident()))
+            .ok_or_else(|| DestroyedResourceError(self.error_ident()).into())
+    }
+
+    pub(crate) fn state(&self) -> Result<&BindGroupState, InvalidResourceError> {
+        let ResourceState::Valid(state) = &self.state else {
+            return Err(InvalidResourceError(self.error_ident()));
+        };
+        Ok(state)
+    }
+
+    pub(crate) fn check_is_valid(&self) -> Result<(), InvalidResourceError> {
+        self.state().map(|_| ())
+    }
+
+    pub(crate) fn invalid(
+        device: Arc<Device>,
+        label: String,
+        layout: Arc<BindGroupLayout>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            state: ResourceState::Invalid,
+            layout,
+            label,
+            tracking_data: TrackingData::new(device.tracker_indices.bind_groups.clone()),
+            used: BindGroupStates::new(),
+            buffer_init_actions: Vec::new(),
+            texture_init_actions: Vec::new(),
+            dynamic_binding_info: Vec::new(),
+            late_buffer_binding_infos: Vec::new(),
+            device,
+        })
     }
 
     pub(crate) fn validate_dynamic_bindings(

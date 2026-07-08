@@ -110,7 +110,7 @@ impl Player {
                 panic!("Unexpected Surface action: winit feature is not enabled")
             }
             Action::CreateBuffer(id, desc) => {
-                let buffer = device.create_buffer(&desc).expect("create_buffer error");
+                let (buffer, _error) = device.create_buffer(&desc);
                 self.buffers.insert(id, buffer);
             }
             Action::DestroyBuffer(id) => {
@@ -153,9 +153,7 @@ impl Player {
                     .iter()
                     .map(|&id| self.resolve_texture_view_id(id))
                     .collect::<Vec<_>>();
-                let external_texture = device
-                    .create_external_texture(&desc, &planes)
-                    .expect("create_external_texture error");
+                let (external_texture, _error) = device.create_external_texture(&desc, &planes);
                 self.external_textures.insert(id, external_texture);
             }
             Action::DestroyExternalTexture(id) => {
@@ -231,9 +229,7 @@ impl Player {
             }
             Action::CreateBindGroup(id, desc) => {
                 let resolved_desc = self.resolve_bind_group_descriptor(desc);
-                let bind_group = device
-                    .create_bind_group(resolved_desc)
-                    .expect("create_bind_group error");
+                let (bind_group, _error) = device.create_bind_group(&resolved_desc);
                 self.bind_groups.insert(id, bind_group);
             }
             Action::DropBindGroup(id) => {
@@ -432,14 +428,14 @@ impl Player {
                 panic!("Error recorded in trace: {error}");
             }
             Action::CreateBlas { id, desc, sizes } => {
-                let blas = device.create_blas(&desc, sizes).expect("create_blas error");
+                let (blas, _error) = device.create_blas(&desc, sizes);
                 self.blas_s.insert(id, blas);
             }
             Action::DropBlas(id) => {
                 self.blas_s.remove(&id).expect("invalid blas");
             }
             Action::CreateTlas { id, desc } => {
-                let tlas = device.create_tlas(&desc).expect("create_tlas error");
+                let (tlas, _error) = device.create_tlas(&desc);
                 self.tlas_s.insert(id, tlas);
             }
             Action::DropTlas(id) => {
@@ -454,7 +450,7 @@ impl Player {
     pub fn get_surface_texture(
         &mut self,
         id: wgc::id::PointerId<wgc::id::markers::Texture>,
-        surface: &wgc::instance::Surface,
+        surface: &Arc<wgc::instance::Surface>,
     ) {
         let frame = surface
             .get_current_texture()

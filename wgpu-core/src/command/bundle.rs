@@ -80,6 +80,7 @@ index format changes.
 
 use alloc::{
     borrow::{Cow, ToOwned as _},
+    boxed::Box,
     string::String,
     string::ToString as _,
     sync::Arc,
@@ -117,8 +118,8 @@ use crate::{
     init_tracker::{BufferInitTrackerAction, MemoryInitKind, TextureInitTrackerAction},
     pipeline::{PipelineFlags, RenderPipeline},
     resource::{
-        Buffer, DestroyedResourceError, Fallible, InvalidResourceError, Labeled, ParentDevice,
-        RawResourceAccess, ResourceState, TrackingData,
+        Buffer, DestroyedResourceError, InvalidOrDestroyedResourceError, InvalidResourceError,
+        Labeled, ParentDevice, RawResourceAccess, ResourceState, TrackingData,
     },
     resource_log,
     snatch::SnatchGuard,
@@ -659,7 +660,7 @@ impl RenderBundleEncoder {
     ) -> Result<(), PassStateError> {
         pass_base!(self, PassErrorScope::SetBindGroup);
         let redundant = self.current_bind_groups.set_and_check_redundant(
-            bind_group_id,
+            &bind_group_id,
             index,
             &mut self.base.dynamic_offsets,
             offsets,
@@ -682,7 +683,7 @@ impl RenderBundleEncoder {
         pipeline_id: id::RenderPipelineId,
     ) -> Result<(), PassStateError> {
         pass_base!(self, PassErrorScope::SetPipelineRender);
-        if self.current_pipeline.set_and_check_redundant(pipeline_id) {
+        if self.current_pipeline.set_and_check_redundant(&pipeline_id) {
             return Ok(());
         }
 
@@ -842,7 +843,7 @@ impl RenderBundleEncoder {
 
 fn set_bind_group(
     state: &mut State,
-    bind_group_guard: &crate::storage::Storage<Fallible<BindGroup>>,
+    bind_group_guard: &crate::storage::Storage<Arc<BindGroup>>,
     dynamic_offsets: &[u32],
     index: u32,
     num_dynamic_offsets: usize,
@@ -867,7 +868,7 @@ fn set_bind_group(
     let bind_group = bind_group_id.map(|id| bind_group_guard.get(id));
 
     if let Some(bind_group) = bind_group {
-        let bind_group = bind_group.get()?;
+        bind_group.check_is_valid()?;
         bind_group.same_device(&state.device)?;
         bind_group.validate_dynamic_bindings(index, offsets)?;
 
@@ -935,13 +936,14 @@ fn set_pipeline(
 // This function is duplicative of `render::set_index_buffer`.
 fn set_index_buffer(
     state: &mut State,
-    buffer_guard: &crate::storage::Storage<Fallible<Buffer>>,
+    buffer_guard: &crate::storage::Storage<Arc<Buffer>>,
     buffer_id: id::Id<id::markers::Buffer>,
     index_format: wgt::IndexFormat,
     offset: u64,
     size: Option<NonZeroU64>,
 ) -> Result<(), RenderBundleErrorInner> {
-    let buffer = buffer_guard.get(buffer_id).get()?;
+    let buffer = buffer_guard.get(buffer_id);
+    buffer.check_is_valid()?;
 
     state
         .trackers
@@ -974,7 +976,7 @@ fn set_index_buffer(
 // This function is duplicative of `render::set_vertex_buffer`.
 fn set_vertex_buffer(
     state: &mut State,
-    buffer_guard: &crate::storage::Storage<Fallible<Buffer>>,
+    buffer_guard: &crate::storage::Storage<Arc<Buffer>>,
     slot: u32,
     buffer_id: Option<id::Id<id::markers::Buffer>>,
     offset: u64,
@@ -990,7 +992,8 @@ fn set_vertex_buffer(
     }
 
     if let Some(buffer_id) = buffer_id {
-        let buffer = buffer_guard.get(buffer_id).get()?;
+        let buffer = buffer_guard.get(buffer_id);
+        buffer.check_is_valid()?;
 
         state
             .trackers
@@ -1189,7 +1192,7 @@ fn draw_mesh_tasks(
 
 fn multi_draw_indirect(
     state: &mut State,
-    buffer_guard: &crate::storage::Storage<Fallible<Buffer>>,
+    buffer_guard: &crate::storage::Storage<Arc<Buffer>>,
     buffer_id: id::Id<id::markers::Buffer>,
     offset: u64,
     family: DrawCommandFamily,
@@ -1199,8 +1202,9 @@ fn multi_draw_indirect(
         .device
         .require_downlevel_flags(wgt::DownlevelFlags::INDIRECT_EXECUTION)?;
 
-    let buffer = buffer_guard.get(buffer_id).get()?;
+    let buffer = buffer_guard.get(buffer_id);
 
+    buffer.check_is_valid()?;
     buffer.same_device(&state.device)?;
     buffer.check_usage(wgt::BufferUsages::INDIRECT)?;
 
@@ -1292,8 +1296,19 @@ pub enum ExecutionError {
     Device(#[from] DeviceError),
     #[error(transparent)]
     DestroyedResource(#[from] DestroyedResourceError),
+    #[error(transparent)]
+    InvalidResource(#[from] InvalidResourceError),
     #[error("Using {0} in a render bundle is not implemented")]
     Unimplemented(&'static str),
+}
+
+impl From<InvalidOrDestroyedResourceError> for ExecutionError {
+    fn from(e: InvalidOrDestroyedResourceError) -> Self {
+        match e {
+            InvalidOrDestroyedResourceError::InvalidResource(e) => Self::InvalidResource(e),
+            InvalidOrDestroyedResourceError::DestroyedResource(e) => Self::DestroyedResource(e),
+        }
+    }
 }
 
 pub type RenderBundleDescriptor<'a> = wgt::RenderBundleDescriptor<Label<'a>>;
@@ -1357,7 +1372,7 @@ impl RenderBundle {
         self.state().map(|_| ())
     }
 
-    pub(crate) fn invalid(device: Arc<Device>, desc: &RenderBundleDescriptor) -> Arc<Self> {
+    pub fn invalid(device: Arc<Device>, desc: &RenderBundleDescriptor) -> Arc<Self> {
         Arc::new(RenderBundle {
             state: ResourceState::Invalid,
             base: BasePass {
@@ -1863,8 +1878,6 @@ pub enum RenderBundleErrorInner {
     MissingDownlevelFlags(#[from] MissingDownlevelFlags),
     #[error(transparent)]
     Bind(#[from] BindError),
-    #[error(transparent)]
-    InvalidResource(#[from] InvalidResourceError),
     #[error("Render bundle encoder has already ended")]
     Ended,
 }
@@ -1884,20 +1897,18 @@ where
 pub struct RenderBundleError {
     pub scope: PassErrorScope,
     #[source]
-    inner: RenderBundleErrorInner,
+    inner: Box<RenderBundleErrorInner>,
 }
 
 impl WebGpuError for RenderBundleError {
     fn webgpu_error_type(&self) -> ErrorType {
-        let Self { scope: _, inner } = self;
-        match inner {
+        match self.inner.as_ref() {
             RenderBundleErrorInner::Create(e) => e.webgpu_error_type(),
             RenderBundleErrorInner::Device(e) => e.webgpu_error_type(),
             RenderBundleErrorInner::RenderCommand(e) => e.webgpu_error_type(),
             RenderBundleErrorInner::Draw(e) => e.webgpu_error_type(),
             RenderBundleErrorInner::MissingDownlevelFlags(e) => e.webgpu_error_type(),
             RenderBundleErrorInner::Bind(e) => e.webgpu_error_type(),
-            RenderBundleErrorInner::InvalidResource(e) => e.webgpu_error_type(),
             RenderBundleErrorInner::Ended => ErrorType::Validation,
         }
     }
@@ -1907,7 +1918,7 @@ impl RenderBundleError {
     pub fn from_device_error(e: DeviceError) -> Self {
         Self {
             scope: PassErrorScope::Bundle,
-            inner: e.into(),
+            inner: Box::new(e.into()),
         }
     }
 }
@@ -1919,7 +1930,7 @@ where
     fn map_pass_err(self, scope: PassErrorScope) -> RenderBundleError {
         RenderBundleError {
             scope,
-            inner: self.into(),
+            inner: Box::new(self.into()),
         }
     }
 }

@@ -22,19 +22,19 @@ use wgt::{
 };
 
 #[cfg(feature = "trace")]
-use crate::device::trace;
+use crate::device::trace::{self, IntoTrace as _};
 use crate::{
     api_log,
     binding_model::{
         self, BindGroup, BindGroupLateBufferBindingInfo, BindGroupLayout,
-        BindGroupLayoutEntryError, BindGroupLayoutState, CreateBindGroupError,
+        BindGroupLayoutEntryError, BindGroupLayoutState, BindGroupState, CreateBindGroupError,
         CreateBindGroupLayoutError,
     },
     command, conv,
     device::{
         bgl, create_validator, features_to_naga_capabilities, life::WaitIdleError, map_buffer,
-        AttachmentData, DeviceLostInvocation, HostMap, MissingDownlevelFlags, MissingFeatures,
-        RenderPassContext,
+        AttachmentData, BufferMapPendingClosure, DeviceLostInvocation, HostMap,
+        MissingDownlevelFlags, MissingFeatures, RenderPassContext,
     },
     hal_label,
     init_tracker::{
@@ -47,9 +47,9 @@ use crate::{
     pool::ResourcePool,
     present,
     resource::{
-        self, Buffer, ExternalTexture, Fallible, Labeled, ParentDevice, QuerySet, QuerySetState,
-        RawResourceAccess, ResourceState, Sampler, StagingBuffer, Texture, TextureView,
-        TextureViewNotRenderableReason, TextureViewState, Tlas, TrackingData,
+        self, Buffer, BufferState, ExternalTexture, ExternalTextureState, Labeled, ParentDevice,
+        QuerySet, QuerySetState, RawResourceAccess, ResourceState, Sampler, StagingBuffer, Texture,
+        TextureView, TextureViewNotRenderableReason, TextureViewState, Tlas, TrackingData,
     },
     resource_log,
     snatch::{SnatchGuard, SnatchLock, Snatchable},
@@ -204,6 +204,26 @@ impl ExternalTextureParams {
     }
 }
 
+/// Because all operations are push/swap (no longlived lock),
+/// we can have mutex without lock rank
+pub(crate) struct DeferredBufferMapPendingClosures(
+    parking_lot::Mutex<Vec<BufferMapPendingClosure>>,
+);
+
+impl DeferredBufferMapPendingClosures {
+    pub(crate) fn new() -> Self {
+        Self(parking_lot::Mutex::new(Vec::new()))
+    }
+
+    pub(crate) fn push(&self, closure: BufferMapPendingClosure) {
+        self.0.lock().push(closure);
+    }
+
+    pub(crate) fn swap(&self, other: &mut Vec<BufferMapPendingClosure>) {
+        mem::swap(&mut *self.0.lock(), other)
+    }
+}
+
 /// Structure describing a logical device. Some members are internally mutable,
 /// stored behind mutexes.
 pub struct Device {
@@ -272,6 +292,8 @@ pub struct Device {
     pub(crate) ordered_texture_usages: wgt::TextureUses,
     pub(crate) instance_flags: wgt::InstanceFlags,
     pub(crate) deferred_destroy: Mutex<Vec<DeferredDestroy>>,
+    /// This closures were created in [`Buffer::drop`] where we do not run them to prevent locking problems.
+    pub(crate) deferred_buffer_map_pending_closures: DeferredBufferMapPendingClosures,
     pub(crate) usage_scopes: UsageScopePool,
     pub(crate) indirect_validation: Option<crate::indirect_validation::IndirectValidation>,
     // Optional so that we can late-initialize this after the queue is created.
@@ -304,7 +326,10 @@ impl fmt::Debug for Device {
 }
 
 impl Drop for Device {
+    #[allow(trivial_casts)]
     fn drop(&mut self) {
+        profiling::scope!("Device::drop");
+        api_log!("Device::drop {:?}", self as *const _);
         resource_log!("Drop {}", self.error_ident());
 
         // SAFETY: We are in the Drop impl and we don't use self.zero_buffer anymore after this
@@ -331,6 +356,20 @@ impl Drop for Device {
                 .destroy_buffer(default_external_texture_params_buffer);
             self.raw.destroy_fence(fence);
         }
+    }
+}
+
+impl Device {
+    pub fn features(&self) -> &wgt::Features {
+        &self.features
+    }
+
+    pub fn limits(&self) -> &wgt::Limits {
+        &self.limits
+    }
+
+    pub fn downlevel(&self) -> &wgt::DownlevelCapabilities {
+        &self.downlevel
     }
 }
 
@@ -560,6 +599,7 @@ impl Device {
             usage_scopes: Mutex::new(rank::DEVICE_USAGE_SCOPES, Default::default()),
             timestamp_normalizer: OnceCellOrLock::new(),
             indirect_validation,
+            deferred_buffer_map_pending_closures: DeferredBufferMapPendingClosures::new(),
         })
     }
 
@@ -754,8 +794,12 @@ impl Device {
                         let Some(bind_group) = bind_group.upgrade() else {
                             continue;
                         };
-                        let Some(raw_bind_group) =
-                            bind_group.raw.snatch(&mut self.snatchable_lock.write())
+                        let Ok(bind_group_state) = bind_group.state() else {
+                            continue;
+                        };
+                        let Some(raw_bind_group) = bind_group_state
+                            .raw
+                            .snatch(&mut self.snatchable_lock.write())
                         else {
                             continue;
                         };
@@ -779,10 +823,14 @@ impl Device {
         assert!(self.queue.set(Arc::downgrade(queue)).is_ok());
     }
 
+    /// Check device for freeable resources and completed buffer mappings.
+    ///
+    /// Return `queue_empty` indicating whether there are more queue submissions still in flight.
     pub fn poll(
         &self,
         poll_type: wgt::PollType<crate::SubmissionIndex>,
     ) -> Result<wgt::PollStatus, WaitIdleError> {
+        api_log!("Device::poll {poll_type:?}");
         let (user_closures, result) = self.poll_and_return_closures(poll_type);
         user_closures.fire();
         result
@@ -835,6 +883,9 @@ impl Device {
         profiling::scope!("Device::maintain");
 
         let mut user_closures = UserClosures::default();
+
+        self.deferred_buffer_map_pending_closures
+            .swap(&mut user_closures.mappings);
 
         // If a wait was requested, determine which submission index to wait for.
         let wait_submission_index = match poll_type {
@@ -1006,7 +1057,7 @@ impl Device {
         (user_closures, result)
     }
 
-    pub fn create_buffer(
+    pub fn create_buffer_inner(
         self: &Arc<Self>,
         desc: &resource::BufferDescriptor,
     ) -> Result<Arc<Buffer>, resource::CreateBufferError> {
@@ -1125,7 +1176,9 @@ impl Device {
             self.create_indirect_validation_bind_groups(buffer.as_ref(), desc.size, desc.usage)?;
 
         let buffer = Buffer {
-            raw: Snatchable::new(buffer),
+            state: ResourceState::Valid(BufferState {
+                raw: Snatchable::new(buffer),
+            }),
             device: self.clone(),
             usage: desc.usage,
             size: desc.size,
@@ -1182,6 +1235,39 @@ impl Device {
             .insert_single(&buffer, buffer_use);
 
         Ok(buffer)
+    }
+
+    pub fn create_buffer(
+        self: &Arc<Self>,
+        desc: &resource::BufferDescriptor,
+    ) -> (Arc<Buffer>, Option<resource::CreateBufferError>) {
+        profiling::scope!("Device::create_buffer");
+
+        let (buffer, error) = match self.create_buffer_inner(desc) {
+            Ok(buffer) => (buffer, None),
+            Err(e) => (Buffer::invalid(Arc::clone(self), desc), Some(e)),
+        };
+        #[cfg(feature = "trace")]
+        if let Some(ref mut trace) = *self.trace.lock() {
+            use trace::IntoTrace;
+            let mut desc = desc.clone();
+            let mapped_at_creation = mem::replace(&mut desc.mapped_at_creation, false);
+            if mapped_at_creation && !desc.usage.contains(wgt::BufferUsages::MAP_WRITE) {
+                desc.usage |= wgt::BufferUsages::COPY_DST;
+            }
+            trace.add(trace::Action::CreateBuffer(buffer.to_trace(), desc));
+        }
+        api_log!(
+            "Device::create_buffer({:?}{}) -> {:?}",
+            desc.label.as_deref().unwrap_or(""),
+            if desc.mapped_at_creation {
+                ", mapped_at_creation"
+            } else {
+                ""
+            },
+            Arc::as_ptr(&buffer)
+        );
+        (buffer, error)
     }
 
     #[cfg(feature = "replay")]
@@ -1245,7 +1331,46 @@ impl Device {
         Ok(())
     }
 
-    pub(crate) fn create_texture_from_hal(
+    /// # Safety
+    ///
+    /// - `hal_texture` must be created from `device_id` corresponding raw handle.
+    /// - `hal_texture` must be created respecting `desc`
+    /// - `hal_texture` must be initialized
+    /// - The `initial_state` must match the actual driver-side state of
+    ///   the wrapped resource at the moment of wrap.
+    pub unsafe fn create_texture_from_hal(
+        self: &Arc<Self>,
+        hal_texture: Box<dyn hal::DynTexture>,
+        desc: &resource::TextureDescriptor,
+        initial_state: wgt::TextureUses,
+    ) -> (Arc<Texture>, Option<resource::CreateTextureError>) {
+        profiling::scope!("Device::create_texture_from_hal");
+
+        let (texture, error) =
+            match self.create_texture_from_hal_inner(hal_texture, desc, initial_state) {
+                Ok(texture) => (texture, None),
+                Err(e) => (Texture::invalid(self, desc), Some(e)),
+            };
+
+        // NB: Any change done through the raw texture handle will not be
+        // recorded in the replay
+        #[cfg(feature = "trace")]
+        if let Some(ref mut trace) = *self.trace.lock() {
+            trace.add(trace::Action::CreateTexture(
+                texture.to_trace(),
+                desc.clone(),
+            ));
+        }
+
+        api_log!(
+            "Device::create_texture({desc:?}) -> {:?}",
+            Arc::as_ptr(&texture)
+        );
+
+        (texture, error)
+    }
+
+    pub(crate) fn create_texture_from_hal_inner(
         self: &Arc<Self>,
         hal_texture: Box<dyn hal::DynTexture>,
         desc: &resource::TextureDescriptor,
@@ -1283,14 +1408,40 @@ impl Device {
     /// - `hal_buffer` must have been created respecting `desc` (in particular, the size).
     /// - `hal_buffer` must be initialized.
     /// - `hal_buffer` must not have zero size.
-    pub(crate) unsafe fn create_buffer_from_hal(
+    pub unsafe fn create_buffer_from_hal(
         self: &Arc<Self>,
         hal_buffer: Box<dyn hal::DynBuffer>,
         desc: &resource::BufferDescriptor,
-    ) -> (Fallible<Buffer>, Option<resource::CreateBufferError>) {
-        let timestamp_normalization_bind_group = unsafe {
-            match self
-                .timestamp_normalizer
+    ) -> (Arc<Buffer>, Option<resource::CreateBufferError>) {
+        let (buffer, error) = match unsafe { self.create_buffer_from_hal_inner(hal_buffer, desc) } {
+            Ok(buffer) => (buffer, None),
+            Err(e) => (Buffer::invalid(Arc::clone(self), desc), Some(e)),
+        };
+
+        // NB: Any change done through the raw buffer handle will not be
+        // recorded in the replay
+        #[cfg(feature = "trace")]
+        if let Some(trace) = self.trace.lock().as_mut() {
+            use trace::IntoTrace;
+            trace.add(trace::Action::CreateBuffer(buffer.to_trace(), desc.clone()));
+        }
+        api_log!("Device::create_buffer -> {:?}", Arc::as_ptr(&buffer));
+        (buffer, error)
+    }
+
+    /// # Safety
+    ///
+    /// - `hal_buffer` must have been created on this device.
+    /// - `hal_buffer` must have been created respecting `desc` (in particular, the size).
+    /// - `hal_buffer` must be initialized.
+    /// - `hal_buffer` must not have zero size.
+    pub(crate) unsafe fn create_buffer_from_hal_inner(
+        self: &Arc<Self>,
+        hal_buffer: Box<dyn hal::DynBuffer>,
+        desc: &resource::BufferDescriptor,
+    ) -> Result<Arc<Buffer>, resource::CreateBufferError> {
+        let timestamp_normalization_bind_group = Snatchable::new(unsafe {
+            self.timestamp_normalizer
                 .get()
                 .unwrap()
                 .create_normalization_bind_group(
@@ -1299,30 +1450,21 @@ impl Device {
                     desc.label.as_deref(),
                     wgt::BufferSize::new(desc.size).unwrap(),
                     desc.usage,
-                ) {
-                Ok(bg) => Snatchable::new(bg),
-                Err(e) => {
-                    return (
-                        Fallible::Invalid(Arc::new(desc.label.to_string())),
-                        Some(e.into()),
-                    )
-                }
-            }
-        };
+                )?
+        });
 
-        let indirect_validation_bind_groups = match self.create_indirect_validation_bind_groups(
+        let indirect_validation_bind_groups = self.create_indirect_validation_bind_groups(
             hal_buffer.as_ref(),
             desc.size,
             desc.usage,
-        ) {
-            Ok(ok) => ok,
-            Err(e) => return (Fallible::Invalid(Arc::new(desc.label.to_string())), Some(e)),
-        };
+        )?;
 
         unsafe { self.raw().add_raw_buffer(&*hal_buffer) };
 
         let buffer = Buffer {
-            raw: Snatchable::new(hal_buffer),
+            state: ResourceState::Valid(BufferState {
+                raw: Snatchable::new(hal_buffer),
+            }),
             device: self.clone(),
             usage: desc.usage,
             size: desc.size,
@@ -1345,7 +1487,7 @@ impl Device {
             .buffers
             .insert_single(&buffer, wgt::BufferUses::empty());
 
-        (Fallible::Valid(buffer), None)
+        Ok(buffer)
     }
 
     fn create_indirect_validation_bind_groups(
@@ -1757,11 +1899,12 @@ impl Device {
         self: &Arc<Self>,
         desc: &resource::TextureDescriptor,
     ) -> (Arc<Texture>, Option<resource::CreateTextureError>) {
+        profiling::scope!("Device::create_texture");
         let (texture, error) = match self.create_texture_inner(desc) {
             Ok(texture) => (texture, None),
             Err(e) => {
                 let texture = Texture::invalid(self, desc);
-                (Arc::new(texture), Some(e))
+                (texture, Some(e))
             }
         };
         api_log!(
@@ -1786,7 +1929,7 @@ impl Device {
         self: &Arc<Self>,
         desc: &resource::TextureDescriptor,
     ) -> Arc<Texture> {
-        let texture = Arc::new(Texture::invalid(self, desc));
+        let texture = Texture::invalid(self, desc);
         #[cfg(feature = "trace")]
         if let Some(ref mut trace) = *self.trace.lock() {
             use crate::device::trace::IntoTrace as _;
@@ -2165,6 +2308,8 @@ impl Device {
         texture: &Arc<Texture>,
         desc: &resource::TextureViewDescriptor,
     ) -> (Arc<TextureView>, Option<resource::CreateTextureViewError>) {
+        profiling::scope!("Texture::create_view");
+
         let (view, error) = match self.create_texture_view_inner(texture, desc) {
             Ok(view) => (view, None),
             Err(e) => (TextureView::invalid(self, texture, desc), Some(e)),
@@ -2191,6 +2336,47 @@ impl Device {
     }
 
     pub fn create_external_texture(
+        self: &Arc<Self>,
+        desc: &resource::ExternalTextureDescriptor,
+        planes: &[Arc<TextureView>],
+    ) -> (
+        Arc<ExternalTexture>,
+        Option<resource::CreateExternalTextureError>,
+    ) {
+        profiling::scope!("Device::create_external_texture");
+
+        let (external_texture, error) = match self.create_external_texture_inner(desc, planes) {
+            Ok(external_texture) => (external_texture, None),
+            Err(e) => (ExternalTexture::invalid(Arc::clone(self), desc), Some(e)),
+        };
+
+        #[cfg(feature = "trace")]
+        if let Some(ref mut trace) = *self.trace.lock() {
+            use crate::device::trace;
+            use trace::IntoTrace as _;
+
+            let planes = Box::from(
+                planes
+                    .iter()
+                    .map(|plane| plane.to_trace())
+                    .collect::<Vec<_>>(),
+            );
+            trace.add(trace::Action::CreateExternalTexture {
+                id: external_texture.to_trace(),
+                desc: desc.clone(),
+                planes,
+            });
+        }
+
+        api_log!(
+            "Device::create_external_texture({desc:?}) -> {:?}",
+            Arc::as_ptr(&external_texture)
+        );
+
+        (external_texture, error)
+    }
+
+    pub(crate) fn create_external_texture_inner(
         self: &Arc<Self>,
         desc: &resource::ExternalTextureDescriptor,
         planes: &[Arc<TextureView>],
@@ -2266,7 +2452,7 @@ impl Device {
             usage: wgt::BufferUsages::UNIFORM | wgt::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         };
-        let params = self.create_buffer(&params_desc)?;
+        let params = self.create_buffer_inner(&params_desc)?;
         self.get_queue().unwrap().write_buffer(
             params.clone(),
             0,
@@ -2274,9 +2460,9 @@ impl Device {
         )?;
 
         let external_texture = ExternalTexture {
+            state: ResourceState::Valid(ExternalTextureState { params }),
             device: self.clone(),
             planes,
-            params,
             label: desc.label.to_string(),
             tracking_data: TrackingData::new(self.tracker_indices.external_textures.clone()),
         };
@@ -2426,6 +2612,7 @@ impl Device {
         Arc<pipeline::ShaderModule>,
         Option<pipeline::CreateShaderModuleError>,
     ) {
+        profiling::scope!("Device::create_shader_module");
         #[cfg(feature = "trace")]
         let data = self.trace.lock().as_mut().map(|trace| {
             use crate::device::trace::DataKind;
@@ -2574,7 +2761,7 @@ impl Device {
             pipeline::CreateShaderModuleError::Validation(naga::error::ShaderError {
                 source,
                 label: desc.label.as_ref().map(|l| l.to_string()),
-                inner: Box::new(inner),
+                inner,
             })
         })?;
 
@@ -2776,7 +2963,29 @@ impl Device {
         Ok(Arc::new(module))
     }
 
-    pub(crate) fn create_command_encoder(
+    pub fn create_command_encoder(
+        self: &Arc<Self>,
+        desc: &wgt::CommandEncoderDescriptor<crate::Label>,
+    ) -> (Arc<command::CommandEncoder>, Option<DeviceError>) {
+        profiling::scope!("Device::create_command_encoder");
+
+        let (cmd_enc, error) = match self.create_command_encoder_inner(&desc.label) {
+            Ok(cmd_enc) => (cmd_enc, None),
+            Err(e) => (
+                command::CommandEncoder::new_invalid(self, &desc.label, e.clone().into()),
+                Some(e),
+            ),
+        };
+
+        api_log!(
+            "Device::create_command_encoder -> {:?}",
+            Arc::as_ptr(&cmd_enc)
+        );
+
+        (cmd_enc, error)
+    }
+
+    pub(crate) fn create_command_encoder_inner(
         self: &Arc<Self>,
         label: &crate::Label,
     ) -> Result<Arc<command::CommandEncoder>, DeviceError> {
@@ -2842,6 +3051,8 @@ impl Device {
         self: &Arc<Self>,
         desc: &binding_model::BindGroupLayoutDescriptor,
     ) -> (Arc<BindGroupLayout>, Option<CreateBindGroupLayoutError>) {
+        profiling::scope!("Device::create_bind_group_layout");
+
         let (bgl, error) = match self.create_bind_group_layout_inner(desc) {
             Ok(layout) => (layout, None),
             Err(e) => (
@@ -2858,6 +3069,10 @@ impl Device {
                 desc.clone(),
             ));
         }
+        api_log!(
+            "Device::create_bind_group_layout -> {:?}",
+            Arc::as_ptr(&bgl)
+        );
         (bgl, error)
     }
 
@@ -3216,6 +3431,7 @@ impl Device {
 
         used.buffers.insert_single(buffer.clone(), internal_use);
 
+        buffer.check_is_valid()?;
         buffer.same_device(self)?;
 
         buffer.check_usage(pub_usage)?;
@@ -3408,6 +3624,7 @@ impl Device {
 
         used.acceleration_structures.insert_single(tlas.clone());
 
+        tlas.check_is_valid()?;
         tlas.same_device(self)?;
 
         match decl.ty {
@@ -3445,6 +3662,7 @@ impl Device {
     > {
         use crate::binding_model::CreateBindGroupError as Error;
 
+        let external_texture_state = external_texture.state()?;
         external_texture.same_device(self)?;
 
         used.external_textures
@@ -3483,9 +3701,14 @@ impl Device {
             .collect::<Result<Vec<_>, Error>>()?;
         let planes = planes.try_into().unwrap();
 
-        used.buffers
-            .insert_single(external_texture.params.clone(), wgt::BufferUses::UNIFORM);
-        let params = external_texture.params.binding(0, None, snatch_guard)?.0;
+        used.buffers.insert_single(
+            external_texture_state.params.clone(),
+            wgt::BufferUses::UNIFORM,
+        );
+        let params = external_texture_state
+            .params
+            .binding(0, None, snatch_guard)?
+            .0;
 
         Ok(hal::ExternalTextureBinding { planes, params })
     }
@@ -3543,17 +3766,50 @@ impl Device {
         Ok(hal::ExternalTextureBinding { planes, params })
     }
 
-    // This function expects the provided bind group layout to be resolved
-    // (not passing a duplicate) beforehand.
     pub fn create_bind_group(
         self: &Arc<Self>,
-        desc: binding_model::ResolvedBindGroupDescriptor,
+        desc: &binding_model::ResolvedBindGroupDescriptor,
+    ) -> (Arc<BindGroup>, Option<CreateBindGroupError>) {
+        profiling::scope!("Device::create_bind_group");
+        #[cfg(feature = "trace")]
+        let trace_desc = (&desc).to_trace();
+
+        let (bind_group, error) = match self.create_bind_group_inner(desc) {
+            Ok(bind_group) => (bind_group, None),
+            Err(e) => (
+                BindGroup::invalid(self.clone(), desc.label.to_string(), desc.layout.clone()),
+                Some(e),
+            ),
+        };
+
+        #[cfg(feature = "trace")]
+        if let Some(ref mut trace) = *self.trace.lock() {
+            trace.add(trace::Action::CreateBindGroup(
+                bind_group.to_trace(),
+                trace_desc,
+            ));
+        }
+
+        api_log!(
+            "Device::create_bind_group -> {:?}",
+            Arc::as_ptr(&bind_group)
+        );
+
+        (bind_group, error)
+    }
+
+    // This function expects the provided bind group layout to be resolved
+    // (not passing a duplicate) beforehand.
+    pub fn create_bind_group_inner(
+        self: &Arc<Self>,
+        desc: &binding_model::ResolvedBindGroupDescriptor,
     ) -> Result<Arc<BindGroup>, CreateBindGroupError> {
         use crate::binding_model::{CreateBindGroupError as Error, ResolvedBindingResource as Br};
 
-        let layout = desc.layout;
-
         self.check_is_valid()?;
+
+        let layout = desc.layout.clone();
+
         layout.same_device(self)?;
         layout.check_is_valid()?;
 
@@ -3784,7 +4040,9 @@ impl Device {
             .collect();
 
         let bind_group = BindGroup {
-            raw: Snatchable::new(raw),
+            state: ResourceState::Valid(BindGroupState {
+                raw: Snatchable::new(raw),
+            }),
             device: self.clone(),
             layout,
             label: desc.label.to_string(),
@@ -4001,6 +4259,7 @@ impl Device {
         Arc<binding_model::PipelineLayout>,
         Option<binding_model::CreatePipelineLayoutError>,
     ) {
+        profiling::scope!("Device::create_pipeline_layout");
         let (layout, error) = match self.create_pipeline_layout_impl(desc, false) {
             Ok(layout) => (layout, None),
             Err(e) => (
@@ -4194,6 +4453,7 @@ impl Device {
         Arc<pipeline::ComputePipeline>,
         Option<pipeline::CreateComputePipelineError>,
     ) {
+        profiling::scope!("Device::create_compute_pipeline");
         let (compute_pipeline, error) = match self.create_compute_pipeline_inner(desc.clone()) {
             Ok(compute_pipeline) => (compute_pipeline, None),
             Err(error) => (
@@ -4210,6 +4470,10 @@ impl Device {
                 desc: desc.to_trace(),
             });
         }
+        api_log!(
+            "Device::create_compute_pipeline -> {:?}",
+            Arc::as_ptr(&compute_pipeline)
+        );
         (compute_pipeline, error)
     }
 
@@ -4376,6 +4640,7 @@ impl Device {
         Arc<pipeline::RenderPipeline>,
         Option<pipeline::CreateRenderPipelineError>,
     ) {
+        profiling::scope!("Device::create_render_pipeline");
         let (render_pipeline, error) = match self.create_render_pipeline_inner(desc.clone()) {
             Ok(pipeline) => (pipeline, None),
             Err(e) => (
@@ -4391,6 +4656,10 @@ impl Device {
                 desc: desc.to_trace(),
             });
         }
+        api_log!(
+            "Device::create_render_pipeline -> {:?}",
+            Arc::as_ptr(&render_pipeline)
+        );
         (render_pipeline, error)
     }
 
@@ -5332,6 +5601,7 @@ impl Device {
         Arc<pipeline::PipelineCache>,
         Option<pipeline::CreatePipelineCacheError>,
     ) {
+        profiling::scope!("Device::create_pipeline_cache");
         let (cache, error) = match unsafe { self.create_pipeline_cache_inner(desc) } {
             Ok(cache) => (cache, None),
             Err(e) => (
@@ -5466,6 +5736,7 @@ impl Device {
         self: &Arc<Self>,
         desc: &resource::QuerySetDescriptor,
     ) -> (Arc<QuerySet>, Option<resource::CreateQuerySetError>) {
+        profiling::scope!("Device::create_query_set");
         let (query_set, error) = match self.create_query_set_inner(desc) {
             Ok(query_set) => (query_set, None),
             Err(e) => (QuerySet::invalid(Arc::clone(self), desc), Some(e)),
@@ -5537,11 +5808,21 @@ impl Device {
 
     pub fn configure_surface(
         self: &Arc<Self>,
-        surface: &crate::instance::Surface,
+        surface: &Arc<crate::instance::Surface>,
         config: &wgt::SurfaceConfiguration<Vec<TextureFormat>>,
     ) -> Option<present::ConfigureSurfaceError> {
         use present::ConfigureSurfaceError as E;
         profiling::scope!("surface_configure");
+
+        #[cfg(feature = "trace")]
+        if let Some(ref mut trace) = *self.trace.lock() {
+            use trace::IntoTrace;
+
+            trace.add(trace::Action::ConfigureSurface(
+                surface.to_trace(),
+                config.clone(),
+            ));
+        }
 
         log::debug!("configuring surface with {config:?}");
 
@@ -5553,7 +5834,7 @@ impl Device {
                     break 'error e.into();
                 }
 
-                let caps = match surface.get_capabilities(&self.adapter) {
+                let caps = match surface.get_hal_capabilities(&self.adapter) {
                     Ok(caps) => caps,
                     Err(_) => break 'error E::UnsupportedQueueFamily,
                 };
@@ -5744,6 +6025,40 @@ impl Device {
             self.ordered_buffer_usages,
             self.ordered_texture_usages,
         )
+    }
+
+    /// `device_lost_closure` might never be called.
+    pub fn set_device_lost_closure(&self, device_lost_closure: DeviceLostClosure) {
+        self.device_lost_closure.lock().replace(device_lost_closure);
+    }
+
+    pub fn destroy(self: &Arc<Self>) {
+        api_log!("Device::destroy {:?}", Arc::as_ptr(self));
+
+        // Follow the steps at
+        // https://gpuweb.github.io/gpuweb/#dom-gpudevice-destroy.
+        // It's legal to call destroy multiple times, but if the device
+        // is already invalid, there's nothing more to do. There's also
+        // no need to return an error.
+        if !self.is_valid() {
+            return;
+        }
+
+        // The last part of destroy is to lose the device. The spec says
+        // delay that until all "currently-enqueued operations on any
+        // queue on this device are completed." This is accomplished by
+        // setting valid to false, and then relying upon maintain to
+        // check for empty queues and a DeviceLostClosure. At that time,
+        // the DeviceLostClosure will be called with "destroyed" as the
+        // reason.
+        self.valid.store(false, Ordering::Release);
+    }
+
+    pub fn get_internal_counters(&self) -> wgt::InternalCounters {
+        wgt::InternalCounters {
+            hal: self.get_hal_counters(),
+            core: wgt::CoreCounters {},
+        }
     }
 
     pub fn get_hal_counters(&self) -> wgt::HalCounters {
