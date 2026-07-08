@@ -392,6 +392,7 @@ impl super::Adapter {
             .force_shader_model
             .get()
             .or(compiler_container.max_shader_model());
+        println!("{wgt_shader_model:?}");
 
         let shader_model = if let Some(max_shader_model) = wgt_shader_model {
             let max_dxc_shader_model = match max_shader_model {
@@ -713,6 +714,8 @@ impl super::Adapter {
                 )
             };
             println!("{res:?}");
+            println!("{features21:?}");
+            println!("{shader_model:?}");
             res.is_ok()
                 && features21.WorkGraphsTier == Direct3D12::D3D12_WORK_GRAPHS_TIER_1_0
                 // Ref: https://microsoft.github.io/DirectX-Specs/d3d/HLSL_ShaderModel6_8.html#work-graphs

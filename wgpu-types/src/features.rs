@@ -1490,6 +1490,7 @@ bitflags_array! {
         /// Allows for creating and dispatching Work Graphs on DirectX12
         /// Supported Backends:
         /// - DX12
+        /// This is a native only feature.
        #[name("wgpu-work-graphs")]
        const EXPERIMENTAL_WORK_GRAPHS = 1 << 63;
 

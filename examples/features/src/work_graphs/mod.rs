@@ -81,13 +81,13 @@ fn create_texels(size: usize) -> Vec<u8> {
 }
 
 struct Example {
-    vertex_buf: wgpu::Buffer,
+    /* vertex_buf: wgpu::Buffer,
     index_buf: wgpu::Buffer,
     index_count: usize,
     bind_group: wgpu::BindGroup,
     uniform_buf: wgpu::Buffer,
     pipeline: wgpu::RenderPipeline,
-    pipeline_wire: Option<wgpu::RenderPipeline>,
+    pipeline_wire: Option<wgpu::RenderPipeline>, */
 }
 
 impl Example {
@@ -110,7 +110,7 @@ impl crate::framework::Example for Example {
         queue: &wgpu::Queue,
     ) -> Self {
         // Create the vertex and index buffers
-        let vertex_size = size_of::<Vertex>();
+        /* let vertex_size = size_of::<Vertex>();
         let (vertex_data, index_data) = create_vertices();
 
         let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -311,7 +311,8 @@ impl crate::framework::Example for Example {
             uniform_buf,
             pipeline,
             pipeline_wire,
-        }
+        } */
+        Example {}
     }
 
     fn update(&mut self, _event: winit::event::WindowEvent) {
@@ -324,21 +325,21 @@ impl crate::framework::Example for Example {
         _device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) {
-        let mx_total = Self::generate_matrix(config.width as f32 / config.height as f32);
+        /* let mx_total = Self::generate_matrix(config.width as f32 / config.height as f32);
         let mx_ref: &[f32; 16] = mx_total.as_ref();
-        queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(mx_ref));
+        queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(mx_ref)); */
     }
 
     fn render(&mut self, view: &wgpu::TextureView, device: &wgpu::Device, queue: &wgpu::Queue) {
-        let mut encoder =
+        /*  let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
-            /* unsafe {
-                encoder.as_hal_mut(|h: Option<&mut wgpu::hal::dx12::CommandEncoder>| unsafe {
-                    h.unwrap().draw_graph()
-                });
-            } */
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        { */
+        /* unsafe {
+            encoder.as_hal_mut(|h: Option<&mut wgpu::hal::dx12::CommandEncoder>| unsafe {
+                h.unwrap().draw_graph()
+            });
+        } */
+        /* let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
@@ -373,7 +374,7 @@ impl crate::framework::Example for Example {
             }
         }
 
-        queue.submit(Some(encoder.finish()));
+        queue.submit(Some(encoder.finish())); */
     }
 
     fn required_features() -> wgpu::Features {
@@ -382,7 +383,7 @@ impl crate::framework::Example for Example {
 }
 
 pub fn main() {
-    crate::framework::run::<Example>("cube");
+    crate::framework::run::<Example>("work-graphs");
 }
 
 #[cfg(test)]
