@@ -1,6 +1,6 @@
 use bytemuck::{Pod, Zeroable};
 use std::f32::consts;
-use wgpu::util::DeviceExt;
+use wgpu::{util::DeviceExt, RenderPipeline};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -103,10 +103,6 @@ impl Example {
 }
 
 impl crate::framework::Example for Example {
-    fn optional_features() -> wgpu::Features {
-        wgpu::Features::POLYGON_MODE_LINE
-    }
-
     fn init(
         config: &wgpu::SurfaceConfiguration,
         _adapter: &wgpu::Adapter,
@@ -337,11 +333,11 @@ impl crate::framework::Example for Example {
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
-            unsafe {
-                encoder.as_hal_mut(|h: Option<wgpu::hal::dx12::CommandEncoder>| unsafe {
+            /* unsafe {
+                encoder.as_hal_mut(|h: Option<&mut wgpu::hal::dx12::CommandEncoder>| unsafe {
                     h.unwrap().draw_graph()
                 });
-            }
+            } */
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -378,6 +374,10 @@ impl crate::framework::Example for Example {
         }
 
         queue.submit(Some(encoder.finish()));
+    }
+
+    fn required_features() -> wgpu::Features {
+        wgpu::Features::EXPERIMENTAL_WORK_GRAPHS | wgpu::Features::PASSTHROUGH_SHADERS
     }
 }
 

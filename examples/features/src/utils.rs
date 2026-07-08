@@ -215,6 +215,8 @@ pub(crate) async fn get_adapter_with_capabilities_or_from_env(
 
             let required_features = *required_features;
             let adapter_features = adapter.features();
+            println!("{:?}", adapter.get_info());
+            println!("{}", adapter.features());
             if !adapter_features.contains(required_features) {
                 continue;
             } else {

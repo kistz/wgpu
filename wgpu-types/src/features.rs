@@ -1487,7 +1487,14 @@ bitflags_array! {
         #[name("wgpu-ray-tracing-pipelines")]
         const EXPERIMENTAL_RAY_TRACING_PIPELINES = 1 << 24;
 
+        /// Allows for creating and dispatching Work Graphs on DirectX12
+        /// Supported Backends:
+        /// - DX12
+       #[name("wgpu-work-graphs")]
+       const EXPERIMENTAL_WORK_GRAPHS = 1 << 63;
+
         // Adding a new feature? All bits in the first u64 are used. Use the second u64 (bits 64+).
+
     }
 
     /// Features that are not guaranteed to be supported.

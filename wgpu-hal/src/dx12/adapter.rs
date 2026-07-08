@@ -701,6 +701,27 @@ impl super::Adapter {
             wgt::Features::EXPERIMENTAL_MESH_SHADER,
             mesh_shader_supported,
         );
+        // Reference: https://microsoft.github.io/DirectX-Specs/d3d/WorkGraphs.html#checkfeaturesupport-structures
+        // The variable has a 1_0 postfix since graphics nodes will have the 1_1 tier and maybe not the same hardware support/shader model
+        let work_graphs_supported_1_0 = {
+            let mut features21 = Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS21::default();
+            let res = unsafe {
+                device.CheckFeatureSupport(
+                    Direct3D12::D3D12_FEATURE_D3D12_OPTIONS21,
+                    <*mut _>::cast(&mut features21),
+                    size_of_val(&features21) as u32,
+                )
+            };
+            println!("{res:?}");
+            res.is_ok()
+                && features21.WorkGraphsTier == Direct3D12::D3D12_WORK_GRAPHS_TIER_1_0
+                // Ref: https://microsoft.github.io/DirectX-Specs/d3d/HLSL_ShaderModel6_8.html#work-graphs
+                && shader_model >= naga::back::hlsl::ShaderModel::V6_8
+        };
+        features.set(
+            wgt::Features::EXPERIMENTAL_WORK_GRAPHS,
+            work_graphs_supported_1_0,
+        );
         let shader_barycentrics_supported = {
             let mut features3 = Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
             unsafe {
