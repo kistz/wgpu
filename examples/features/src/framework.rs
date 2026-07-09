@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use wgpu::{ForceShaderModelToken, Instance, Surface};
+use wgpu::{Dx12Compiler, ForceShaderModelToken, Instance, Surface};
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -269,9 +269,9 @@ impl ExampleContext {
 
         let mut instance_descriptor =
             wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(display_handle));
-        /* instance_descriptor.backend_options.dx12.force_shader_model =
-            unsafe { ForceShaderModelToken::with_shader_model(wgpu::DxcShaderModel::V6_8) };
-        println!("{instance_descriptor:?}"); */
+        instance_descriptor.backend_options.dx12.shader_compiler =
+            Dx12Compiler::default_dynamic_dxc();
+        println!("{instance_descriptor:?}");
         let instance = wgpu::Instance::new(instance_descriptor);
         surface.pre_adapter(&instance, window);
         let adapter = get_adapter_with_capabilities_or_from_env(
