@@ -1,6 +1,6 @@
 use bytemuck::{Pod, Zeroable};
 use std::f32::consts;
-use wgpu::{util::DeviceExt, RenderPipeline};
+use wgpu::{hal::DynDevice, util::DeviceExt, RenderPipeline};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -109,6 +109,13 @@ impl crate::framework::Example for Example {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Self {
+        unsafe {
+            /* device.as_hal_mut(|h: Option<&mut wgpu::hal::dx12::CommandEncoder>| unsafe {
+                h.unwrap().draw_graph()
+            }); */
+            let what = device.as_hal::<wgpu::hal::api::Dx12>().unwrap();
+            what.state_object();
+        }
         // Create the vertex and index buffers
         /* let vertex_size = size_of::<Vertex>();
         let (vertex_data, index_data) = create_vertices();
@@ -312,6 +319,7 @@ impl crate::framework::Example for Example {
             pipeline,
             pipeline_wire,
         } */
+
         Example {}
     }
 

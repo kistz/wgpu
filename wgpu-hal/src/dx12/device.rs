@@ -8,6 +8,14 @@ use alloc::{
 use arrayvec::ArrayVec;
 use core::{ffi, num::NonZeroU32, ptr, time::Duration};
 use std::time::Instant;
+use windows::Win32::Graphics::Direct3D12::{
+    ID3D12StateObject, D3D12_PROGRAM_TYPE_WORK_GRAPH, D3D12_SET_GENERIC_PIPELINE_DESC,
+    D3D12_SET_PROGRAM_DESC, D3D12_SET_WORK_GRAPH_DESC, D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE,
+    D3D12_STATE_OBJECT_DESC, D3D12_STATE_OBJECT_TYPE_EXECUTABLE, D3D12_STATE_SUBOBJECT,
+    D3D12_STATE_SUBOBJECT_TYPE, D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH, D3D12_WORK_GRAPH_DESC,
+    D3D12_WORK_GRAPH_FLAGS, D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES,
+};
+use windows_core::PCWSTR;
 
 use bytemuck::TransparentWrapper;
 use parking_lot::Mutex;
@@ -497,6 +505,44 @@ impl super::Device {
                 size,
             ),
         }
+    }
+
+    pub unsafe fn state_object(&self) {
+        let state_object = D3D12_STATE_OBJECT_DESC {
+            Type: D3D12_STATE_OBJECT_TYPE_EXECUTABLE,
+            NumSubobjects: todo!(),
+            pSubobjects: todo!(),
+        };
+        let sub_obj = D3D12_STATE_SUBOBJECT {
+            Type: D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH,
+            pDesc: todo!(),
+        };
+
+        let wg = D3D12_WORK_GRAPH_DESC {
+            ProgramName: PCWSTR::null(),
+            Flags: D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES,
+            NumEntrypoints: todo!(),
+            pEntrypoints: todo!(),
+            NumExplicitlyDefinedNodes: todo!(),
+            pExplicitlyDefinedNodes: todo!(),
+        };
+
+        let huh = D3D12_SET_PROGRAM_DESC {
+            Type: D3D12_PROGRAM_TYPE_WORK_GRAPH,
+            Anonymous: Direct3D12::D3D12_SET_PROGRAM_DESC_0 {
+                WorkGraph: D3D12_SET_WORK_GRAPH_DESC {
+                    ProgramIdentifier: todo!(),
+                    Flags: D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE,
+                    BackingMemory: todo!(),
+                    NodeLocalRootArgumentsTable: todo!(),
+                },
+            },
+        };
+
+        if let Ok(device) = self.raw.cast::<Direct3D12::ID3D12Device5>() {
+            let what =
+                unsafe { device.CreateStateObject::<ID3D12StateObject>(&state_object) }.unwrap();
+        };
     }
 }
 
