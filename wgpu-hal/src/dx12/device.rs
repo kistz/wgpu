@@ -9,8 +9,9 @@ use arrayvec::ArrayVec;
 use core::{ffi, num::NonZeroU32, ptr, time::Duration};
 use std::time::Instant;
 use windows::Win32::Graphics::Direct3D12::{
-    ID3D12StateObject, D3D12_PROGRAM_TYPE_WORK_GRAPH, D3D12_SET_GENERIC_PIPELINE_DESC,
-    D3D12_SET_PROGRAM_DESC, D3D12_SET_WORK_GRAPH_DESC, D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE,
+    ID3D12GraphicsCommandList10, ID3D12StateObject, D3D12_DXIL_LIBRARY_DESC,
+    D3D12_PROGRAM_TYPE_WORK_GRAPH, D3D12_SET_GENERIC_PIPELINE_DESC, D3D12_SET_PROGRAM_DESC,
+    D3D12_SET_WORK_GRAPH_DESC, D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE, D3D12_SHADER_BYTECODE,
     D3D12_STATE_OBJECT_DESC, D3D12_STATE_OBJECT_TYPE_EXECUTABLE, D3D12_STATE_SUBOBJECT,
     D3D12_STATE_SUBOBJECT_TYPE, D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH, D3D12_WORK_GRAPH_DESC,
     D3D12_WORK_GRAPH_FLAGS, D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES,
@@ -507,24 +508,44 @@ impl super::Device {
         }
     }
 
-    pub unsafe fn state_object(&self) {
-        let state_object = D3D12_STATE_OBJECT_DESC {
-            Type: D3D12_STATE_OBJECT_TYPE_EXECUTABLE,
-            NumSubobjects: todo!(),
-            pSubobjects: todo!(),
-        };
-        let sub_obj = D3D12_STATE_SUBOBJECT {
-            Type: D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH,
-            pDesc: todo!(),
+    pub unsafe fn state_object(&self) -> ID3D12StateObject {
+        let mut dxil_lib_desc = D3D12_DXIL_LIBRARY_DESC {
+            DXILLibrary: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: shader_blob.as_ptr() as _,
+                BytecodeLength: shader_blob.len(),
+            },
+            NumExports: 0, // Set exports if needed
+            pExports: std::ptr::null(),
         };
 
-        let wg = D3D12_WORK_GRAPH_DESC {
+        let wg_sub_desc = D3D12_WORK_GRAPH_DESC {
             ProgramName: PCWSTR::null(),
             Flags: D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES,
             NumEntrypoints: todo!(),
             pEntrypoints: todo!(),
             NumExplicitlyDefinedNodes: todo!(),
             pExplicitlyDefinedNodes: todo!(),
+        };
+
+        let mut subobjects = vec![
+            D3D12_STATE_SUBOBJECT {
+                Type: D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH,
+                pDesc: &mut wg_sub_desc as *mut _ as _,
+            },
+            D3D12_STATE_SUBOBJECT {
+                Type: D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY,
+                pDesc: &mut dxil_lib_desc as *mut _ as _,
+            },
+            /* D3D12_STATE_SUBOBJECT {
+                Type: D3D12_STATE_SUBOBJECT_TYPE_MAX_EXPORTS,
+                pDesc: &mut max_payload_size as *mut _ as _, // Define your max size
+            }, */
+        ];
+
+        let state_object = D3D12_STATE_OBJECT_DESC {
+            Type: D3D12_STATE_OBJECT_TYPE_EXECUTABLE,
+            NumSubobjects: subobjects.len() as u32,
+            pSubobjects: subobjects.as_mut_ptr(),
         };
 
         let huh = D3D12_SET_PROGRAM_DESC {
