@@ -1,219 +1,146 @@
-// FILE BORROWED: All Rights remain to the original authors. https://github.com/GPUOpen-LibrariesAndSDKs/WorkGraphPlayground
+//=================================================================================================================================
+//
+// Copyright (c) Microsoft. All rights reserved.
+// This code is licensed under the MIT License (MIT).
+// THIS CODE IS PROVIDED *AS IS* WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING ANY
+// IMPLIED WARRANTIES OF FITNESS FOR A PARTICULAR PURPOSE, MERCHANTABILITY, OR NON-INFRINGEMENT.
+//
+//=================================================================================================================================
 
-// This file is part of the AMD & HSC Work Graph Playground.
-//
-// Copyright (C) 2025 Advanced Micro Devices, Inc. and Coburg University of Applied Sciences and Arts.
-// All rights reserved.
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files(the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and /or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions :
-//
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-// THE SOFTWARE.
+// ================================================================================================================================
+// D3D12 Hello Work Graphs shaders
+// 
+// Defines a work graph that is a chain of 3 nodes with different launch modes.
+// The nodes log output to a UAV that's just an array of uints.
+// 
+// The C++ code seeds the graph with 4 records "entryRecord".
+// The second node writes to location UAV[entryRecordIndex] and the third node writes to location UAV[4 + entryNodeIndex],
+// so 8 uints modified in total.  These are printed to the console by the calling C++ code.  A simple tweak you can do
+// in the C++ code is make it log more uints to the console if you want to play around with making the graph do more.
+// 
+// The app asks D3D to autopopulate the graph based on all nodes available, so you can play around with adding
+// and changing nodes without having to change the C++ code, unless you want to tweak how the graph is seeded or how
+// results are printed to console.
+// 
+// ================================================================================================================================
+GlobalRootSignature globalRS = { "UAV(u0)" };
+RWStructuredBuffer<uint> UAV : register(u0); // 16MB byte buffer from global root sig
 
-#include "Common.h"
-
-struct Line
+struct entryRecord
 {
-    float2 a, b;
+    uint gridSize : SV_DispatchGrid;
+    uint recordIndex;
 };
 
-// [Task 2 Solution]:
-struct Box
+struct secondNodeInput
 {
-    float2 topLeft;
-    float size;
+    uint entryRecordIndex;
+    uint incrementValue;
 };
 
-[Shader("node")]
-    [NodeIsProgramEntry]
-    [NodeLaunch("thread")]
-    [NodeId("Entry")] void EntryNode(
-        [MaxRecords(3)]
-            [NodeId("Snowflake")] NodeOutput<Line>
-                snowflakeOutput,
-
-        // [Task 2 Solution]: Single record output to the "Sponge" node.
-        [MaxRecords(1)]
-            [NodeId("Sponge")] NodeOutput<Box>
-                spongeOutput)
+struct thirdNodeInput
 {
-    const bool stackVertical = RenderSize.x > RenderSize.y;
-    const float scale = stackVertical ? min(RenderSize.x * .225, RenderSize.y * .45) : min(RenderSize.x * .45, RenderSize.y * .225);
-    // Draw Snowflake fractal.
-    {
-        const float2 snowflakeCenter = RenderSize * (stackVertical ? float2(.25, .5) : float2(.5, .25));
+    uint entryRecordIndex;
+};
 
-        // Request three output records for the three sides of the initial equilateral triangle.
-        ThreadNodeOutputRecords<Line> outputRecords =
-            snowflakeOutput.GetThreadNodeOutputRecords(3);
+static const uint c_numEntryRecords = 4;
 
-        // Compute three vertices of the initial equilateral triangle.
-        const float2 v0 = snowflakeCenter + scale * float2(0., -1.);
-        const float2 v1 = snowflakeCenter + scale * float2(-sqrt(3) * .5, .5);
-        const float2 v2 = snowflakeCenter + scale * float2(+sqrt(3) * .5, .5);
+// --------------------------------------------------------------------------------------------------------------------------------
+// firstNode is the entry node, a broadcasting launch node.
+// 
+// For each entry record, a dispatch grid is spawned with grid size from inputData.gridSize.
+// 
+// Grid size can also be fixed for the node instead of being part of the input record,
+// using [NodeDispatchGrid(x,y,z)]
+// 
+// Each thread group sends 2 records to secondNode asking it to do some work.
+// --------------------------------------------------------------------------------------------------------------------------------
+[Shader("node")]
+[NodeLaunch("broadcasting")]
+[NodeMaxDispatchGrid(16,1,1)] // Contrived value, input records from the app only top out at grid size of 4.  
+                              // This declaration should be as accurate as possible, but not too small (undefined behavior).
+[NumThreads(2,1,1)]
+void firstNode(
+    DispatchNodeInputRecord<entryRecord> inputData,
+    [MaxRecords(2)] NodeOutput<secondNodeInput> secondNode,
+    uint threadIndex : SV_GroupIndex,
+    uint dispatchThreadID : SV_DispatchThreadID)
+{
+    // Methods for allocating output records must be called at thread group scope (uniform call across the group)
+    // Allocations can be per thread as well: GetThreadNodeOutputRecords(...), but the call still has to be
+    // group uniform albeit with thread-varying arguments.  Thread execution doesn't have to be synchronized (Barrier call not needed).
+    GroupNodeOutputRecords<secondNodeInput> outRecs =
+        secondNode.GetGroupNodeOutputRecords(2);
 
-        // Create the initial equilateral triangle.
-        outputRecords.Get(0).a = v0;
-        outputRecords.Get(0).b = v1;
-
-        outputRecords.Get(1).a = v1;
-        outputRecords.Get(2).a = v2;
-
-        outputRecords.Get(2).b = v0;
-        outputRecords.Get(1).b = v2;
-
-        outputRecords.OutputComplete();
-    }
-
-    // Draw Sponge fractal.
-    {
-        const float2 spongeCenter = RenderSize * (stackVertical ? float2(.75, .5) : float2(.5, .75));
-
-        // [Solution 2]: Request a single record for the "Sponge" node and write the initial box
-        //               position and size to it.
-        ThreadNodeOutputRecords<Box> outputRecord = spongeOutput.GetThreadNodeOutputRecords(1);
-
-        outputRecord.Get().topLeft = spongeCenter - scale;
-        outputRecord.Get().size = 2 * scale;
-
-        outputRecord.OutputComplete();
-    }
+    // In a future language version, "->" will be available instead of ".Get()" below to access record members
+    outRecs[threadIndex].entryRecordIndex = inputData.Get().recordIndex; // inputData is constant for all threads in a dispatch grid, 
+                                                                         // broadcast from input record
+    outRecs[threadIndex].incrementValue = dispatchThreadID*2 + threadIndex + 1; // tell consumer how much to increment UAV[entryRecordIndex]
+    outRecs.OutputComplete(); // Call must be group uniform.  Thread execution doesn't have to be synchronized (Barrier call not needed).
 }
 
-    [Shader("node")]
-    [NodeLaunch("thread")]
-    // If a node declares a recursive output to itself (see "recursiveOutput" below),
-    // a "[NodeMaxRecursionDepth(...)]" is required to specify the maximum number of recursion levels.
-    // This is required, as each recursion level counts towards the total graph depth,
-    // and the runtime has to ensure that this depth does not exceed the limit of 32 nodes.
-    // We can use "GetRemainingRecursionLevels()" in the node function to query the remaining
-    // recursion levels, i.e., determine whether we can still request recursive output records.
-    [NodeMaxRecursionDepth(4)]
-    [NodeId("Snowflake")] void SnowflakeNode(
-        ThreadNodeInputRecord<Line> inputRecord,
-
-        [MaxRecords(4)]
-            [NodeId("Snowflake")] NodeOutput<Line>
-                recursiveOutput)
+// --------------------------------------------------------------------------------------------------------------------------------
+// secondNode is thread launch, so one thread per input record.
+// 
+// Logs to the UAV and then sends a task to thirdNode
+// --------------------------------------------------------------------------------------------------------------------------------
+[Shader("node")]
+[NodeLaunch("thread")]
+void secondNode(
+    ThreadNodeInputRecord<secondNodeInput> inputData,
+    [MaxRecords(1)] NodeOutput<thirdNodeInput> thirdNode)
 {
-    const float2 a = inputRecord.Get().a;
-    const float2 b = inputRecord.Get().b;
+    // In a future language version, "->" will be available instead of ".Get()" to access record members
 
-    // Check if we have reached the recursion limit.
-    const bool hasOutput = GetRemainingRecursionLevels() != 0;
+    // UAV[entryRecordIndex] (as uint) is the sum of all outputs from upstream node for graph entry [entryRecordIndex]
+    InterlockedAdd(UAV[inputData.Get().entryRecordIndex], inputData.Get().incrementValue);
 
-    // Each recursion level has a 4x amplification factor, as each line
-    // splits into four new lines.
-    ThreadNodeOutputRecords<Line> outputRecords =
-        recursiveOutput.GetThreadNodeOutputRecords(hasOutput * 4);
-
-    if (hasOutput)
-    {
-        // Perpendicular vector to current line segment.
-        const float2 perp = float2(a.y - b.y, b.x - a.x) * sqrt(3) / 6;
-
-        // Compute vertices for the four new line segments:
-        //
-        //             v2
-        //            /  \
-        //           /    \
-        // v0 ---- v1      v3 ---- v4
-        const float2 v0 = a;
-        const float2 v1 = lerp(a, b, 1. / 3.);
-        const float2 v2 = lerp(a, b, .5) + perp;
-        const float2 v3 = lerp(a, b, 2. / 3.);
-        const float2 v4 = b;
-
-        outputRecords.Get(0).a = v0;
-        outputRecords.Get(0).b = v1;
-
-        outputRecords.Get(1).a = v1;
-        outputRecords.Get(1).b = v2;
-
-        outputRecords.Get(2).a = v2;
-        outputRecords.Get(2).b = v3;
-
-        outputRecords.Get(3).a = v3;
-        outputRecords.Get(3).b = v4;
-    }
-    else
-    {
-        // We've reached the recursion limit, thus we draw the current line segment
-        // to the output.
-        DrawLine(a, b);
-    }
-
-    outputRecords.OutputComplete();
+    // For every thread send a task to thirdNode
+    ThreadNodeOutputRecords<thirdNodeInput> outRec = thirdNode.GetThreadNodeOutputRecords(1);
+    outRec.Get().entryRecordIndex = inputData.Get().entryRecordIndex;
+    outRec.OutputComplete();
 }
 
-// [Task 2 Solution]:
+groupshared uint g_sum[c_numEntryRecords];
+
+// --------------------------------------------------------------------------------------------------------------------------------
+// thirdNode is coalescing launch, so thread groups are launched with up to 32 records as input in an array.
+// 
+// The thread group size happens to match this max input array size of 32, but doesn't have to.
+// --------------------------------------------------------------------------------------------------------------------------------
 [Shader("node")]
-    [NodeLaunch("thread")]
-    [NodeMaxRecursionDepth(4)]
-    [NodeId("Sponge")] void
-    SpongeNode(
-        ThreadNodeInputRecord<Box> inputRecord,
-
-        [MaxRecords(8)]
-            [NodeId("Sponge")] NodeOutput<Box>
-                recursiveOutput)
+[NodeLaunch("coalescing")]
+[NumThreads(32,1,1)]
+void thirdNode(
+    [MaxRecords(32)] GroupNodeInputRecords<thirdNodeInput> inputData,
+    uint threadIndex : SV_GroupIndex)
 {
-    const float2 topLeft = inputRecord.Get().topLeft;
-    const float size = inputRecord.Get().size;
-
-    // Check if we have reached the recursion limit.
-    const bool hasOutput = GetRemainingRecursionLevels() != 0;
-
-    // Split each box into eight boxes:
-    // +---+---+---+
-    // | 0 | 1 | 2 |
-    // +---+---+---+
-    // | 3 |   | 4 |
-    // +---+---+---+
-    // | 5 | 6 | 7 |
-    // +---+---+---+
-    ThreadNodeOutputRecords<Box> outputRecords = recursiveOutput.GetThreadNodeOutputRecords(hasOutput * 8);
-
-    if (hasOutput)
+    // Check how many records we got
+    // It could be less than the max declared if the system doesn't have that many
+    // work items left, or if it doesn't want to wait for more records to arrive at this node before
+    // flushing the current work.
+    if (threadIndex >= inputData.Count())
+        return;
+         
+    for (uint i = 0; i < c_numEntryRecords; i++)
     {
-        const float newSize = size / 3.;
-
-        uint outputRecordIndex = 0;
-
-        for (uint row = 0; row < 3; ++row)
-        {
-            for (uint col = 0; col < 3; ++col)
-            {
-                // Skip the center (see visualization above).
-                if (row == 1 && col == 1)
-                    continue;
-
-                outputRecords.Get(outputRecordIndex).size = newSize;
-                outputRecords.Get(outputRecordIndex).topLeft = topLeft + float2(col * newSize, row * newSize);
-
-                // Advance to next output record.
-                outputRecordIndex++;
-            }
-        }
-    }
-    else
-    {
-        // We've reached the recursion limit, thus we draw the current box to the output.
-        FillRect(topLeft, topLeft + size);
+        g_sum[i] = 0;
     }
 
-    outputRecords.OutputComplete();
+    // New way to do barriers by parameter.
+    // This instance is like GroupMemoryBarrierWithGroupSync();
+    Barrier(GROUP_SHARED_MEMORY, GROUP_SCOPE|GROUP_SYNC);
+
+    InterlockedAdd(g_sum[inputData[threadIndex].entryRecordIndex],1);
+
+    Barrier(GROUP_SHARED_MEMORY, GROUP_SCOPE|GROUP_SYNC);
+
+    if (threadIndex > 0)
+        return;
+
+    for (uint l = 0; l < c_numEntryRecords; l++)
+    {
+        uint recordIndex = c_numEntryRecords + l;
+        InterlockedAdd(UAV[recordIndex],g_sum[l]);
+    }
 }

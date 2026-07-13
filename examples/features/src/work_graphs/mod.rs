@@ -2,82 +2,34 @@ use bytemuck::{Pod, Zeroable};
 use std::f32::consts;
 use wgpu::{hal::DynDevice, util::DeviceExt, RenderPipeline};
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct Vertex {
-    _pos: [f32; 4],
-    _tex_coord: [f32; 2],
-}
-
-fn vertex(pos: [i8; 3], tc: [i8; 2]) -> Vertex {
-    Vertex {
-        _pos: [pos[0] as f32, pos[1] as f32, pos[2] as f32, 1.0],
-        _tex_coord: [tc[0] as f32, tc[1] as f32],
+fn compile_hlsl(device: &wgpu::Device, entry: &str, stage_str: &str) -> wgpu::ShaderModule {
+    let out_path = format!(
+        "{}/src/mesh_shader/shader.{stage_str}.cso",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let cmd = std::process::Command::new("dxc")
+        .args([
+            "-T",
+            &format!("{stage_str}_6_5"),
+            "-E",
+            entry,
+            &format!("{}/src/mesh_shader/shader.hlsl", env!("CARGO_MANIFEST_DIR")),
+            "-Fo",
+            &out_path,
+        ])
+        .output()
+        .unwrap();
+    if !cmd.status.success() {
+        panic!("DXC failed:\n{}", String::from_utf8(cmd.stderr).unwrap());
     }
-}
-
-fn create_vertices() -> (Vec<Vertex>, Vec<u16>) {
-    let vertex_data = [
-        // top (0, 0, 1)
-        vertex([-1, -1, 1], [0, 0]),
-        vertex([1, -1, 1], [1, 0]),
-        vertex([1, 1, 1], [1, 1]),
-        vertex([-1, 1, 1], [0, 1]),
-        // bottom (0, 0, -1)
-        vertex([-1, 1, -1], [1, 0]),
-        vertex([1, 1, -1], [0, 0]),
-        vertex([1, -1, -1], [0, 1]),
-        vertex([-1, -1, -1], [1, 1]),
-        // right (1, 0, 0)
-        vertex([1, -1, -1], [0, 0]),
-        vertex([1, 1, -1], [1, 0]),
-        vertex([1, 1, 1], [1, 1]),
-        vertex([1, -1, 1], [0, 1]),
-        // left (-1, 0, 0)
-        vertex([-1, -1, 1], [1, 0]),
-        vertex([-1, 1, 1], [0, 0]),
-        vertex([-1, 1, -1], [0, 1]),
-        vertex([-1, -1, -1], [1, 1]),
-        // front (0, 1, 0)
-        vertex([1, 1, -1], [1, 0]),
-        vertex([-1, 1, -1], [0, 0]),
-        vertex([-1, 1, 1], [0, 1]),
-        vertex([1, 1, 1], [1, 1]),
-        // back (0, -1, 0)
-        vertex([1, -1, 1], [0, 0]),
-        vertex([-1, -1, 1], [1, 0]),
-        vertex([-1, -1, -1], [1, 1]),
-        vertex([1, -1, -1], [0, 1]),
-    ];
-
-    let index_data: &[u16] = &[
-        0, 1, 2, 2, 3, 0, // top
-        4, 5, 6, 6, 7, 4, // bottom
-        8, 9, 10, 10, 11, 8, // right
-        12, 13, 14, 14, 15, 12, // left
-        16, 17, 18, 18, 19, 16, // front
-        20, 21, 22, 22, 23, 20, // back
-    ];
-
-    (vertex_data.to_vec(), index_data.to_vec())
-}
-
-fn create_texels(size: usize) -> Vec<u8> {
-    (0..size * size)
-        .map(|id| {
-            // get high five for recognizing this ;)
-            let cx = 3.0 * (id % size) as f32 / (size - 1) as f32 - 2.0;
-            let cy = 2.0 * (id / size) as f32 / (size - 1) as f32 - 1.0;
-            let (mut x, mut y, mut count) = (cx, cy, 0);
-            while count < 0xFF && x * x + y * y < 4.0 {
-                let old_x = x;
-                x = x * x - y * y + cx;
-                y = 2.0 * old_x * y + cy;
-                count += 1;
-            }
-            count
+    let file = std::fs::read(&out_path).unwrap();
+    std::fs::remove_file(out_path).unwrap();
+    unsafe {
+        device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
+            dxil: Some(std::borrow::Cow::Owned(file)),
+            ..Default::default()
         })
-        .collect()
+    }
 }
 
 struct Example {
@@ -114,7 +66,7 @@ impl crate::framework::Example for Example {
                 h.unwrap().draw_graph()
             }); */
             let what = device.as_hal::<wgpu::hal::api::Dx12>().unwrap();
-            what.state_object();
+            //what.state_object();
         }
         // Create the vertex and index buffers
         /* let vertex_size = size_of::<Vertex>();
@@ -339,50 +291,119 @@ impl crate::framework::Example for Example {
     }
 
     fn render(&mut self, view: &wgpu::TextureView, device: &wgpu::Device, queue: &wgpu::Queue) {
-        /*  let mut encoder =
+        let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        { */
-        /* unsafe {
-            encoder.as_hal_mut(|h: Option<&mut wgpu::hal::dx12::CommandEncoder>| unsafe {
-                h.unwrap().draw_graph()
-            });
-        } */
-        /* let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            rpass.push_debug_group("Prepare data for draw.");
-            rpass.set_pipeline(&self.pipeline);
-            rpass.set_bind_group(0, &self.bind_group, &[]);
-            rpass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint16);
-            rpass.set_vertex_buffer(0, self.vertex_buf.slice(..));
-            rpass.pop_debug_group();
-            rpass.insert_debug_marker("Draw!");
-            rpass.draw_indexed(0..self.index_count as u32, 0, 0..1);
-            if let Some(ref pipe) = self.pipeline_wire {
-                rpass.set_pipeline(pipe);
-                rpass.draw_indexed(0..self.index_count as u32, 0, 0..1);
-            }
-        }
+        {
+            unsafe {
+                encoder.as_hal_mut(|h: Option<&mut wgpu::hal::dx12::CommandEncoder>| unsafe {
+                    //h.unwrap().draw_graph()
 
-        queue.submit(Some(encoder.finish())); */
+                    // For production, load your compiled DXIL bytecode (.bin) file containing SM 6.8
+                    let dxil_bytecode: Vec<u8> =
+                        std::fs::read("work_graph.dxil").expect("Failed to load DXIL");
+
+                    // -------------------------------------------------------------
+                    // 3. Define the State Object Subobjects to assemble the Work Graph
+                    // -------------------------------------------------------------
+                    let mut subobjects = Vec::new();
+
+                    // A. Define the DXIL Library container
+                    let dxil_lib_desc = D3D12_DXIL_LIBRARY_DESC {
+                        DXILLibrary: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: dxil_bytecode.as_ptr() as *const _,
+                            BytecodeLength: dxil_bytecode.len(),
+                        },
+                        NumExports: 0, // 0 exports means implicitly export all nodes in the file
+                        pExports: std::ptr::null(),
+                    };
+
+                    subobjects.push(D3D12_STATE_SUBOBJECT {
+                        Type: D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY,
+                        pDesc: &dxil_lib_desc as *const _ as *const _,
+                    });
+
+                    // B. Explicitly define the Work Graph Config
+                    let graph_name = windows::core::w!("MyWorkGraph");
+                    let work_graph_desc = D3D12_WORK_GRAPH_DESC {
+                        ProgramName: graph_name.as_ptr(),
+                        Flags: D3D12_WORK_GRAPH_FLAG_NONE,
+                        NumExplicitNodes: 0, // Auto-detect nodes based on shader entry point attributes
+                        pExplicitNodes: std::ptr::null(),
+                    };
+
+                    subobjects.push(D3D12_STATE_SUBOBJECT {
+                        Type: D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH,
+                        pDesc: &work_graph_desc as *const _ as *const _,
+                    });
+
+                    // -------------------------------------------------------------
+                    // 4. Create the final Executable State Object
+                    // -------------------------------------------------------------
+                    let state_object_desc = D3D12_STATE_OBJECT_DESC {
+                        Type: D3D12_STATE_OBJECT_TYPE_COLLECTION,
+                        NumSubobjects: subobjects.len() as u32,
+                        pSubobjects: subobjects.as_ptr(),
+                    };
+
+                    let mut state_object: Option<ID3D12StateObject> = None;
+                    device.CreateStateObject(&state_object_desc, &mut state_object)?;
+                    let state_object = state_object.unwrap();
+
+                    // -------------------------------------------------------------
+                    // 5. Query Graph Properties and Allocate Backing Memory
+                    // -------------------------------------------------------------
+                    // Work Graphs require scratch memory allocated by the CPU for internal GPU scheduling data
+                    let work_graph_properties: ID3D12WorkGraphProperties = state_object.cast()?;
+                    let graph_index = work_graph_properties.GetWorkGraphIndex(graph_name);
+
+                    let mut memory_requirements = D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS::default();
+                    work_graph_properties
+                        .GetWorkGraphMemoryRequirements(graph_index, &mut memory_requirements);
+
+                    // Allocate a raw GPU buffer matched exactly to 'memory_requirements.MaxSizeInBytes'
+                    let backing_memory_buffer =
+                        create_gpu_buffer(device, memory_requirements.MaxSizeInBytes)?;
+
+                    Ok(())
+                });
+            }
+            /* let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.1,
+                                g: 0.2,
+                                b: 0.3,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                rpass.push_debug_group("Prepare data for draw.");
+                rpass.set_pipeline(&self.pipeline);
+                rpass.set_bind_group(0, &self.bind_group, &[]);
+                rpass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+                rpass.set_vertex_buffer(0, self.vertex_buf.slice(..));
+                rpass.pop_debug_group();
+                rpass.insert_debug_marker("Draw!");
+                rpass.draw_indexed(0..self.index_count as u32, 0, 0..1);
+                if let Some(ref pipe) = self.pipeline_wire {
+                    rpass.set_pipeline(pipe);
+                    rpass.draw_indexed(0..self.index_count as u32, 0, 0..1);
+                }
+            }
+
+            queue.submit(Some(encoder.finish())); */
+        }
     }
 
     fn required_features() -> wgpu::Features {

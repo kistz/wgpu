@@ -508,7 +508,7 @@ impl super::Device {
         }
     }
 
-    pub unsafe fn state_object(&self) -> ID3D12StateObject {
+    /* pub unsafe fn state_object(&self) -> ID3D12StateObject {
         let mut dxil_lib_desc = D3D12_DXIL_LIBRARY_DESC {
             DXILLibrary: D3D12_SHADER_BYTECODE {
                 pShaderBytecode: shader_blob.as_ptr() as _,
@@ -564,7 +564,7 @@ impl super::Device {
             let what =
                 unsafe { device.CreateStateObject::<ID3D12StateObject>(&state_object) }.unwrap();
         };
-    }
+    }*/
 }
 
 impl crate::Device for super::Device {

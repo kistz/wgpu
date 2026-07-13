@@ -8,7 +8,8 @@ use windows::{
         Foundation,
         Graphics::{
             Direct3D12::{
-                self, ID3D12Device4, D3D12_STATE_OBJECT_DESC, D3D12_STATE_OBJECT_TYPE_EXECUTABLE,
+                self, ID3D12Device4, ID3D12GraphicsCommandList, D3D12_STATE_OBJECT_DESC,
+                D3D12_STATE_OBJECT_TYPE_EXECUTABLE,
             },
             Dxgi,
         },
@@ -389,7 +390,7 @@ impl super::CommandEncoder {
 
         (t, buffer)
     }
-    pub unsafe fn dispatch_graph(&mut self) {
+    pub unsafe fn raw_list(&mut self) -> ID3D12GraphicsCommandList {
         let state_object = D3D12_STATE_OBJECT_DESC {
             Type: D3D12_STATE_OBJECT_TYPE_EXECUTABLE,
             NumSubobjects: todo!(),
@@ -397,7 +398,7 @@ impl super::CommandEncoder {
         };
         //let huh: ID3D12Device4 = self.device.into();
         let dev = self.device.as_raw().cast::<Direct3D12::ID3D12Device4>();
-        
+        let hmmge = windows::core::w!("WHAT");
 
         /* self.prepare_dispatch([group_count_x, group_count_y, group_count_z]);
         let cmd_list10: Direct3D12::ID3D12GraphicsCommandList10 =
@@ -406,6 +407,7 @@ impl super::CommandEncoder {
         unsafe {
             cmd_list10.DispatchGraph(group_count_x, group_count_y, group_count_z);
         } */
+        self.list.unwrap()
     }
 }
 
