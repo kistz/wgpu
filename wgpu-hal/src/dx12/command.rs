@@ -1,7 +1,5 @@
 use alloc::vec::Vec;
 use core::{mem, ops::Range};
-use khronos_egl::Upcast;
-
 use windows::{
     core::Interface as _,
     Win32::{
