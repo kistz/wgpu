@@ -2012,6 +2012,10 @@ impl crate::Device for super::Device {
         unimplemented!("Work graphs are unsupported on Metal")
     }
 
+    unsafe fn get_buffer_device_address(&self, _buffer: &super::Buffer) -> wgt::BufferAddress {
+        unimplemented!("Work graphs are unsupported on Metal")
+    }
+
     unsafe fn create_pipeline_cache(
         &self,
         _desc: &crate::PipelineCacheDescriptor<'_>,

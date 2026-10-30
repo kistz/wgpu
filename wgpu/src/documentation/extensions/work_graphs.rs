@@ -53,6 +53,21 @@ the limits declared by the nodes. For example, an `SV_DispatchGrid` value larger
 Bind groups and immediates are shared with compute pipelines, because work graphs use the
 compute root signature.
 
+### Input in GPU memory
+
+[`ComputePass::dispatch_graph_indirect`] reads the input from a buffer when the dispatch executes,
+so earlier GPU commands can generate it. The buffer holds a [`WorkGraphGpuNodeInput`] for one
+entrypoint, or a [`WorkGraphGpuMultiNodeInput`] that points to an array of them.
+
+This input refers to records and node inputs by GPU address. [`Buffer::work_graph_input_address`]
+returns the address of a buffer, which does not change while the buffer exists. Every buffer that
+the input refers to must be passed to `dispatch_graph_indirect`, so that `wgpu` keeps it alive and
+inserts barriers between it and other commands. `wgpu` cannot check what the GPU reads, so the
+caller must make sure that the input is valid when the dispatch executes.
+
+Traces that are replayed by the `player` contain the addresses from the original run, so GPU input
+is not replayed correctly.
+
 ```rust,ignore
 let pipeline = device.create_work_graph_pipeline(&wgpu::WorkGraphPipelineDescriptor {
     label: Some("work graph"),
@@ -81,11 +96,30 @@ unsafe {
         records: bytemuck::cast_slice(&records),
     }]);
 }
+
+let input = wgpu::WorkGraphGpuNodeInput {
+    entrypoint_index: 0,
+    num_records: records.len() as u32,
+    records_address: records_buffer.work_graph_input_address(),
+    record_stride: size_of::<Record>() as u64,
+};
+let input_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    label: Some("work graph input"),
+    contents: input.as_bytes(),
+    usage: wgpu::BufferUsages::STORAGE,
+});
+unsafe {
+    pass.dispatch_graph_indirect(
+        &input_buffer,
+        0,
+        wgpu::WorkGraphGpuInputMode::SingleNode,
+        &[&records_buffer],
+    );
+}
 ```
 
 ## Not yet supported
 
-- Records generated on the GPU (`D3D12_DISPATCH_MODE_NODE_GPU_INPUT`).
 - Overriding node properties in the work graph description.
 - Mesh nodes.
 
@@ -93,6 +127,6 @@ unsafe {
 */
 
 use crate::{
-    BufferUsages, ComputePass, Device, Dx12BackendOptions, Features, PipelineLayout,
-    WorkGraphPipeline,
+    Buffer, BufferUsages, ComputePass, Device, Dx12BackendOptions, Features, PipelineLayout,
+    WorkGraphGpuMultiNodeInput, WorkGraphGpuNodeInput, WorkGraphPipeline,
 };

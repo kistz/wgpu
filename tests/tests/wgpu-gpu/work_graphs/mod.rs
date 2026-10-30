@@ -18,6 +18,9 @@ pub fn all_tests(tests: &mut Vec<GpuTestInitializer>) {
         WORK_GRAPH_REPEATED_RECORD,
         WORK_GRAPH_MULTI_NODE_INPUT,
         WORK_GRAPH_SHARED_BACKING_MEMORY,
+        WORK_GRAPH_GPU_INPUT,
+        WORK_GRAPH_GPU_MULTI_NODE_INPUT,
+        WORK_GRAPH_GPU_GENERATED_INPUT,
     ]);
 }
 
@@ -41,6 +44,29 @@ fn input(records: &[[u32; 4]], record_stride: u64) -> wgpu::WorkGraphNodeInput<&
         num_records: records.len() as u32,
         record_stride,
         records: bytemuck::cast_slice(records),
+    }
+}
+
+fn gpu_buffer(ctx: &TestingContext, label: &str, contents: &[u8]) -> wgpu::Buffer {
+    ctx.device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents,
+            usage: wgpu::BufferUsages::STORAGE,
+        })
+}
+
+/// GPU input for `num_records` entry records in `records`, starting at `offset`.
+fn gpu_node_input(
+    records: &wgpu::Buffer,
+    offset: u64,
+    num_records: u32,
+) -> wgpu::WorkGraphGpuNodeInput {
+    wgpu::WorkGraphGpuNodeInput {
+        entrypoint_index: 0,
+        num_records,
+        records_address: records.work_graph_input_address() + offset,
+        record_stride: 16,
     }
 }
 
@@ -302,4 +328,157 @@ static WORK_GRAPH_SHARED_BACKING_MEMORY: GpuTestConfiguration = GpuTestConfigura
 
         let output = resources.submit_and_read(&ctx, encoder).await;
         assert_eq!(output, expected(&[15, 8]));
+    });
+
+#[apply(gpu_test!)]
+static WORK_GRAPH_GPU_INPUT: GpuTestConfiguration = GpuTestConfiguration::new()
+    .parameters(parameters())
+    .run_async(|ctx| async move {
+        let resources = Resources::new(&ctx);
+        let pipeline = resources.pipeline(&ctx, "graph");
+        let backing_memory = resources.backing_memory(&ctx, &[&pipeline]);
+
+        let records = [entry_record(2, 1), entry_record(1, 10)];
+        let records = gpu_buffer(&ctx, "records", bytemuck::cast_slice(&records));
+        let input = gpu_buffer(&ctx, "input", gpu_node_input(&records, 0, 2).as_bytes());
+
+        let mut encoder = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = resources.begin_pass(&mut encoder);
+            pass.set_work_graph_pipeline(&pipeline, backing_memory.slice(..));
+            unsafe {
+                pass.dispatch_graph_indirect(
+                    &input,
+                    0,
+                    wgpu::WorkGraphGpuInputMode::SingleNode,
+                    &[&records],
+                )
+            };
+        }
+
+        let output = resources.submit_and_read(&ctx, encoder).await;
+        assert_eq!(output, expected(&[11, 1]));
+    });
+
+#[apply(gpu_test!)]
+static WORK_GRAPH_GPU_MULTI_NODE_INPUT: GpuTestConfiguration = GpuTestConfiguration::new()
+    .parameters(parameters())
+    .run_async(|ctx| async move {
+        let resources = Resources::new(&ctx);
+        let pipeline = resources.pipeline(&ctx, "graph");
+        let backing_memory = resources.backing_memory(&ctx, &[&pipeline]);
+
+        let records = [entry_record(1, 1), entry_record(2, 16)];
+        let records = gpu_buffer(&ctx, "records", bytemuck::cast_slice(&records));
+        let node_inputs = [
+            gpu_node_input(&records, 0, 1),
+            gpu_node_input(&records, 16, 1),
+        ];
+        let node_inputs = gpu_buffer(&ctx, "node inputs", bytemuck::cast_slice(&node_inputs));
+        let multi_node_input = wgpu::WorkGraphGpuMultiNodeInput::new(
+            2,
+            node_inputs.work_graph_input_address(),
+            size_of::<wgpu::WorkGraphGpuNodeInput>() as u64,
+        );
+        // Place the input at a nonzero offset.
+        let mut contents = vec![0; 8];
+        contents.extend_from_slice(multi_node_input.as_bytes());
+        let input = gpu_buffer(&ctx, "input", &contents);
+
+        let mut encoder = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = resources.begin_pass(&mut encoder);
+            pass.set_work_graph_pipeline(&pipeline, backing_memory.slice(..));
+            unsafe {
+                pass.dispatch_graph_indirect(
+                    &input,
+                    8,
+                    wgpu::WorkGraphGpuInputMode::MultiNode,
+                    &[&node_inputs, &records],
+                )
+            };
+        }
+
+        let output = resources.submit_and_read(&ctx, encoder).await;
+        assert_eq!(output, expected(&[17, 16]));
+    });
+
+/// Writes two entry records and the record count of a `WorkGraphGpuNodeInput`.
+const RECORD_GENERATOR: &str = "
+@group(0) @binding(0) var<storage, read_write> node_input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> records: array<vec4<u32>>;
+
+@compute @workgroup_size(2)
+fn main(@builtin(local_invocation_index) index: u32) {
+    records[index] = vec4(2u - index, 1u, 1u, 1u + 9u * index);
+    if index == 0u {
+        node_input[1] = 2u;
+    }
+}
+";
+
+/// Generates the input of a work graph with a compute shader in the same pass.
+#[apply(gpu_test!)]
+static WORK_GRAPH_GPU_GENERATED_INPUT: GpuTestConfiguration = GpuTestConfiguration::new()
+    .parameters(parameters())
+    .run_async(|ctx| async move {
+        let resources = Resources::new(&ctx);
+        let pipeline = resources.pipeline(&ctx, "graph");
+        let backing_memory = resources.backing_memory(&ctx, &[&pipeline]);
+
+        let records = gpu_buffer(&ctx, "records", &[0; 32]);
+        let input = gpu_buffer(&ctx, "input", gpu_node_input(&records, 0, 0).as_bytes());
+
+        let generator = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("record generator"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(RECORD_GENERATOR)),
+            });
+        let generator = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("record generator"),
+                layout: None,
+                module: &generator,
+                entry_point: None,
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let generator_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &generator.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: records.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&generator);
+            pass.set_bind_group(0, &generator_bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+
+            pass.set_work_graph_pipeline(&pipeline, backing_memory.slice(..));
+            pass.set_bind_group(0, &resources.bind_group, &[]);
+            unsafe {
+                pass.dispatch_graph_indirect(
+                    &input,
+                    0,
+                    wgpu::WorkGraphGpuInputMode::SingleNode,
+                    &[&records],
+                )
+            };
+        }
+
+        let output = resources.submit_and_read(&ctx, encoder).await;
+        assert_eq!(output, expected(&[11, 1]));
     });

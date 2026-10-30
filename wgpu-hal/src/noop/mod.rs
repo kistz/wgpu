@@ -436,6 +436,9 @@ impl crate::Device for Context {
         Ok((Resource, info))
     }
     unsafe fn destroy_work_graph_pipeline(&self, pipeline: Resource) {}
+    unsafe fn get_buffer_device_address(&self, buffer: &Buffer) -> wgt::BufferAddress {
+        Default::default()
+    }
     unsafe fn create_pipeline_cache(
         &self,
         desc: &crate::PipelineCacheDescriptor<'_>,

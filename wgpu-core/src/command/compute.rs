@@ -204,6 +204,17 @@ pub enum WorkGraphError {
         size: u64,
         required: u64,
     },
+    #[error(
+        "GPU input offset {0} is not a multiple of {alignment}",
+        alignment = wgt::WORK_GRAPH_GPU_INPUT_ALIGNMENT
+    )]
+    UnalignedGpuInputOffset(BufferAddress),
+    #[error("GPU input of {input_size} bytes starting at offset {offset} would overrun buffer of size {buffer_size}")]
+    GpuInputOverrun {
+        input_size: BufferAddress,
+        offset: BufferAddress,
+        buffer_size: BufferAddress,
+    },
 }
 
 impl WebGpuError for WorkGraphError {
@@ -426,12 +437,14 @@ impl<'scope, 'snatch_guard, 'cmd_enc> State<'scope, 'snatch_guard, 'cmd_enc> {
     /// pass.
     ///
     /// The `work_graph_backing_memory` argument should be passed for any work
-    /// graph dispatch.
+    /// graph dispatch. `work_graph_input_buffers` are the buffers that work graph
+    /// input in GPU memory reads from.
     fn flush_bindings(
         &mut self,
         indirect_buffer: Option<&Arc<Buffer>>,
         track_indirect_buffer: bool,
         work_graph_backing_memory: Option<&Arc<Buffer>>,
+        work_graph_input_buffers: &[Arc<Buffer>],
     ) -> Result<(), ComputePassErrorInner> {
         for bind_group in self.pass.binder.list_active() {
             unsafe { self.pass.scope.merge_bind_group(&bind_group.used)? };
@@ -452,6 +465,12 @@ impl<'scope, 'snatch_guard, 'cmd_enc> State<'scope, 'snatch_guard, 'cmd_enc> {
                 .scope
                 .buffers
                 .merge_single(buffer, wgt::BufferUses::WORK_GRAPH_BACKING_MEMORY)?;
+        }
+        for buffer in work_graph_input_buffers {
+            self.pass
+                .scope
+                .buffers
+                .merge_single(buffer, wgt::BufferUses::STORAGE_READ_ONLY)?;
         }
 
         // For compute, usage scopes are associated with each dispatch and not
@@ -478,14 +497,15 @@ impl<'scope, 'snatch_guard, 'cmd_enc> State<'scope, 'snatch_guard, 'cmd_enc> {
                 .remove_usage(buffer, wgt::BufferUses::INDIRECT);
         }
 
-        if let Some(buffer) = work_graph_backing_memory {
-            self.intermediate_trackers
-                .buffers
-                .set_and_remove_from_usage_scope_sparse(
-                    &mut self.pass.scope.buffers,
-                    [buffer.tracker_index()],
-                );
-        }
+        self.intermediate_trackers
+            .buffers
+            .set_and_remove_from_usage_scope_sparse(
+                &mut self.pass.scope.buffers,
+                work_graph_backing_memory
+                    .into_iter()
+                    .chain(work_graph_input_buffers)
+                    .map(|buffer| buffer.tracker_index()),
+            );
 
         flush_bindings_helper(&mut self.pass)?;
 
@@ -896,8 +916,25 @@ pub(super) fn encode_compute_pass(
                     .map_pass_err(scope)?;
             }
             ArcComputeCommand::DispatchGraph { inputs } => {
-                let scope = PassErrorScope::DispatchGraph;
+                let scope = PassErrorScope::DispatchGraph { indirect: false };
                 dispatch_graph(&mut state, inputs).map_pass_err(scope)?;
+            }
+            ArcComputeCommand::DispatchGraphIndirect {
+                buffer,
+                offset,
+                mode,
+                referenced_buffers,
+            } => {
+                let scope = PassErrorScope::DispatchGraph { indirect: true };
+                dispatch_graph_indirect(
+                    &mut state,
+                    device,
+                    buffer,
+                    offset,
+                    mode,
+                    referenced_buffers,
+                )
+                .map_pass_err(scope)?;
             }
             ArcComputeCommand::PushDebugGroup { color: _, len } => {
                 pass::push_debug_group(&mut state.pass, &base.string_data, len);
@@ -1059,7 +1096,7 @@ fn dispatch_workgroups(state: &mut State, groups: [u32; 3]) -> Result<(), Comput
 
     state.is_ready()?;
 
-    state.flush_bindings(None, false, None)?;
+    state.flush_bindings(None, false, None, &[])?;
     state.flush_immediates();
 
     let groups_size_limit = state
@@ -1246,7 +1283,7 @@ fn dispatch_workgroups_indirect(
                 }]);
         }
 
-        state.flush_bindings(Some(&buffer), false, None)?;
+        state.flush_bindings(Some(&buffer), false, None, &[])?;
         unsafe {
             state
                 .pass
@@ -1255,7 +1292,7 @@ fn dispatch_workgroups_indirect(
                 .dispatch_workgroups_indirect(params.dst_buffer, 0);
         }
     } else {
-        state.flush_bindings(Some(&buffer), true, None)?;
+        state.flush_bindings(Some(&buffer), true, None, &[])?;
         state.flush_immediates();
         let buf_raw = buffer.try_raw(state.pass.base.snatch_guard)?;
         unsafe {
@@ -1336,12 +1373,9 @@ fn set_work_graph_pipeline(
     Ok(())
 }
 
-fn dispatch_graph(
-    state: &mut State,
-    inputs: Vec<wgt::WorkGraphNodeInput<Vec<u8>>>,
-) -> Result<(), ComputePassErrorInner> {
-    api_log!("ComputePass::dispatch_graph");
-
+fn check_work_graph_ready<'a>(
+    state: &'a State,
+) -> Result<&'a WorkGraphState, ComputePassErrorInner> {
     let Some(work_graph) = state.work_graph.as_ref() else {
         return Err(WorkGraphError::MissingPipeline.into());
     };
@@ -1356,6 +1390,17 @@ fn dispatch_graph(
         .binder
         .check_late_buffer_bindings()
         .map_err(DispatchError::from)?;
+
+    Ok(work_graph)
+}
+
+fn dispatch_graph(
+    state: &mut State,
+    inputs: Vec<wgt::WorkGraphNodeInput<Vec<u8>>>,
+) -> Result<(), ComputePassErrorInner> {
+    api_log!("ComputePass::dispatch_graph");
+
+    let work_graph = check_work_graph_ready(state)?;
 
     let entrypoints = &work_graph.pipeline.entrypoints;
     for (input_index, input) in inputs.iter().enumerate() {
@@ -1407,7 +1452,7 @@ fn dispatch_graph(
     let size = work_graph.size;
     let initialize = work_graph.initialize;
 
-    state.flush_bindings(None, false, Some(&backing_memory))?;
+    state.flush_bindings(None, false, Some(&backing_memory), &[])?;
     state.flush_immediates();
 
     let inputs = inputs
@@ -1432,7 +1477,92 @@ fn dispatch_graph(
                     size,
                 },
                 initialize,
-                inputs: &inputs,
+                inputs: hal::DispatchGraphInputs::Cpu(&inputs),
+            });
+    }
+
+    if let Some(work_graph) = state.work_graph.as_mut() {
+        work_graph.initialize = false;
+    }
+    Ok(())
+}
+
+fn dispatch_graph_indirect(
+    state: &mut State,
+    device: &Arc<Device>,
+    buffer: Arc<Buffer>,
+    offset: BufferAddress,
+    mode: wgt::WorkGraphGpuInputMode,
+    referenced_buffers: Vec<Arc<Buffer>>,
+) -> Result<(), ComputePassErrorInner> {
+    api_log!("ComputePass::dispatch_graph_indirect");
+
+    let work_graph = check_work_graph_ready(state)?;
+    let backing_memory = work_graph.backing_memory.clone();
+    let backing_memory_offset = work_graph.offset;
+    let backing_memory_size = work_graph.size;
+    let initialize = work_graph.initialize;
+
+    if !offset.is_multiple_of(wgt::WORK_GRAPH_GPU_INPUT_ALIGNMENT) {
+        return Err(WorkGraphError::UnalignedGpuInputOffset(offset).into());
+    }
+    let input_size = mode.input_size();
+    if buffer.size < input_size || buffer.size - input_size < offset {
+        return Err(WorkGraphError::GpuInputOverrun {
+            input_size,
+            offset,
+            buffer_size: buffer.size,
+        }
+        .into());
+    }
+
+    let snatch_guard = state.pass.base.snatch_guard;
+    for referenced in core::iter::once(&buffer).chain(&referenced_buffers) {
+        referenced.same_device(device)?;
+        referenced.check_usage(wgt::BufferUsages::STORAGE)?;
+        referenced.check_destroyed(snatch_guard)?;
+    }
+
+    // The ranges of the referenced buffers that the input reads are unknown.
+    let init_ranges = core::iter::once((&buffer, offset..offset + input_size)).chain(
+        referenced_buffers
+            .iter()
+            .map(|referenced| (referenced, 0..referenced.size)),
+    );
+    for (referenced, range) in init_ranges {
+        state.pass.base.buffer_memory_init_actions.extend(
+            referenced.initialization_status.read().create_action(
+                referenced,
+                range,
+                MemoryInitKind::NeedsInitializedMemory,
+            ),
+        );
+    }
+
+    let mut input_buffers = referenced_buffers;
+    input_buffers.push(buffer.clone());
+    state.flush_bindings(None, false, Some(&backing_memory), &input_buffers)?;
+    state.flush_immediates();
+
+    let raw_backing_memory = backing_memory.try_raw(snatch_guard)?;
+    let raw_buffer = buffer.try_raw(snatch_guard)?;
+    unsafe {
+        state
+            .pass
+            .base
+            .raw_encoder
+            .dispatch_graph(&hal::DispatchGraphDescriptor {
+                backing_memory: hal::WorkGraphBackingMemory {
+                    buffer: raw_backing_memory,
+                    offset: backing_memory_offset,
+                    size: backing_memory_size,
+                },
+                initialize,
+                inputs: hal::DispatchGraphInputs::Gpu {
+                    buffer: raw_buffer,
+                    offset,
+                    mode,
+                },
             });
     }
 
@@ -1585,7 +1715,7 @@ impl ComputePass {
         &mut self,
         inputs: &[wgt::WorkGraphNodeInput<&[u8]>],
     ) -> Result<(), PassStateError> {
-        let scope = PassErrorScope::DispatchGraph;
+        let scope = PassErrorScope::DispatchGraph { indirect: false };
         let base = pass_base!(self, scope);
 
         base.commands.push(ArcComputeCommand::DispatchGraph {
@@ -1613,6 +1743,59 @@ impl ComputePass {
         if let Err(error) = self.dispatch_graph_inner(inputs) {
             self.device
                 .handle_error(error, self.label(), "ComputePass::dispatch_graph");
+        }
+    }
+
+    fn dispatch_graph_indirect_inner(
+        &mut self,
+        buffer: Arc<Buffer>,
+        offset: BufferAddress,
+        mode: wgt::WorkGraphGpuInputMode,
+        referenced_buffers: Vec<Arc<Buffer>>,
+    ) -> Result<(), PassStateError> {
+        let scope = PassErrorScope::DispatchGraph { indirect: true };
+        let base = pass_base!(self, scope);
+
+        pass_try!(base, scope, buffer.check_is_valid());
+        for referenced in &referenced_buffers {
+            pass_try!(base, scope, referenced.check_is_valid());
+        }
+
+        base.commands
+            .push(ArcComputeCommand::DispatchGraphIndirect {
+                buffer,
+                offset,
+                mode,
+                referenced_buffers,
+            });
+
+        Ok(())
+    }
+
+    /// Submits the work graph input that `buffer` holds at `offset` to the current work graph
+    /// pipeline. The input is read when the dispatch executes.
+    ///
+    /// # Safety
+    ///
+    /// When the dispatch executes, the input must have the layout selected by `mode`, and:
+    ///
+    /// - It must only reference memory of `buffer` and `referenced_buffers`.
+    /// - It must only use valid entrypoint indices, and correctly aligned addresses and strides.
+    /// - Each referenced record must be complete.
+    /// - The input records must not violate any limits declared by the nodes receiving them,
+    ///   such as `SV_DispatchGrid` exceeding `NodeMaxDispatchGrid`.
+    pub unsafe fn dispatch_graph_indirect(
+        &mut self,
+        buffer: Arc<Buffer>,
+        offset: BufferAddress,
+        mode: wgt::WorkGraphGpuInputMode,
+        referenced_buffers: Vec<Arc<Buffer>>,
+    ) {
+        if let Err(error) =
+            self.dispatch_graph_indirect_inner(buffer, offset, mode, referenced_buffers)
+        {
+            self.device
+                .handle_error(error, self.label(), "ComputePass::dispatch_graph_indirect");
         }
     }
 

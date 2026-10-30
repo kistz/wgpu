@@ -1884,6 +1884,12 @@ impl dispatch::BufferInterface for CoreBuffer {
     fn usage(&self) -> crate::BufferUsages {
         self.wgpu_buffer.usage()
     }
+
+    fn work_graph_input_address(&self) -> crate::BufferAddress {
+        self.wgpu_buffer
+            .work_graph_input_address()
+            .unwrap_or_else(|err| handle_error_fatal(err, "Buffer::work_graph_input_address"))
+    }
 }
 
 impl dispatch::TextureInterface for CoreTexture {
@@ -2446,6 +2452,27 @@ impl dispatch::ComputePassInterface for CoreComputePass {
 
     unsafe fn dispatch_graph(&mut self, inputs: &[wgt::WorkGraphNodeInput<&[u8]>]) {
         unsafe { self.pass.dispatch_graph(inputs) };
+    }
+
+    unsafe fn dispatch_graph_indirect(
+        &mut self,
+        input_buffer: &dispatch::DispatchBuffer,
+        input_offset: crate::BufferAddress,
+        mode: wgt::WorkGraphGpuInputMode,
+        referenced_buffers: &[&dispatch::DispatchBuffer],
+    ) {
+        let referenced_buffers = referenced_buffers
+            .iter()
+            .map(|buffer| buffer.as_core().wgpu_buffer.clone())
+            .collect();
+        unsafe {
+            self.pass.dispatch_graph_indirect(
+                input_buffer.as_core().wgpu_buffer.clone(),
+                input_offset,
+                mode,
+                referenced_buffers,
+            )
+        };
     }
 
     fn transition_resources<'a>(

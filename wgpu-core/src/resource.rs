@@ -528,6 +528,27 @@ impl WebGpuError for InvalidResourceError {
     }
 }
 
+#[derive(Clone, Debug, Error)]
+#[non_exhaustive]
+pub enum WorkGraphInputAddressError {
+    #[error(transparent)]
+    MissingFeatures(#[from] MissingFeatures),
+    #[error(transparent)]
+    MissingBufferUsage(#[from] MissingBufferUsageError),
+    #[error(transparent)]
+    DestroyedResource(#[from] DestroyedResourceError),
+}
+
+impl WebGpuError for WorkGraphInputAddressError {
+    fn webgpu_error_type(&self) -> ErrorType {
+        match self {
+            Self::MissingFeatures(e) => e.webgpu_error_type(),
+            Self::MissingBufferUsage(e) => e.webgpu_error_type(),
+            Self::DestroyedResource(e) => e.webgpu_error_type(),
+        }
+    }
+}
+
 pub type BufferAccessResult = Result<MapMode, BufferAccessError>;
 
 pub(crate) struct BufferPendingMapping {
@@ -679,6 +700,19 @@ impl Buffer {
 
     pub(crate) fn check_is_valid(&self) -> Result<(), InvalidResourceError> {
         self.state().map(|_| ())
+    }
+
+    /// Returns the GPU address of the buffer, for use in work graph input in GPU memory.
+    pub fn work_graph_input_address(
+        &self,
+    ) -> Result<wgt::BufferAddress, WorkGraphInputAddressError> {
+        self.device
+            .require_features(wgt::Features::EXPERIMENTAL_WORK_GRAPHS)?;
+        self.check_usage(wgt::BufferUsages::STORAGE)?;
+
+        let snatch_guard = self.device.snatchable_lock.read();
+        let raw = self.try_raw(&snatch_guard)?;
+        Ok(unsafe { self.device.raw().get_buffer_device_address(raw) })
     }
 
     pub fn invalid(device: Arc<Device>, desc: &BufferDescriptor) -> Arc<Self> {

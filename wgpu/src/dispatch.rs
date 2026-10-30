@@ -298,6 +298,8 @@ pub trait BufferInterface: CommonTraits {
     fn size(&self) -> crate::BufferAddress;
 
     fn usage(&self) -> crate::BufferUsages;
+
+    fn work_graph_input_address(&self) -> crate::BufferAddress;
 }
 pub trait TextureInterface: CommonTraits {
     fn create_view(&self, desc: &crate::TextureViewDescriptor<'_>) -> DispatchTextureView;
@@ -464,6 +466,13 @@ pub trait ComputePassInterface: CommonTraits + Drop {
         size: crate::BufferAddress,
     );
     unsafe fn dispatch_graph(&mut self, inputs: &[wgt::WorkGraphNodeInput<&[u8]>]);
+    unsafe fn dispatch_graph_indirect(
+        &mut self,
+        input_buffer: &DispatchBuffer,
+        input_offset: crate::BufferAddress,
+        mode: wgt::WorkGraphGpuInputMode,
+        referenced_buffers: &[&DispatchBuffer],
+    );
 
     fn transition_resources<'a>(
         &mut self,

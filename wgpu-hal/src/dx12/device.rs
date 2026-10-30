@@ -2540,6 +2540,10 @@ impl crate::Device for super::Device {
         self.counters.work_graph_pipelines.sub(1);
     }
 
+    unsafe fn get_buffer_device_address(&self, buffer: &super::Buffer) -> wgt::BufferAddress {
+        unsafe { buffer.resource.GetGPUVirtualAddress() }
+    }
+
     unsafe fn create_pipeline_cache(
         &self,
         _desc: &crate::PipelineCacheDescriptor<'_>,

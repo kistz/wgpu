@@ -83,6 +83,22 @@ fn input(
     }
 }
 
+fn storage_bind_group_layout(device: &Device) -> BindGroupLayout {
+    device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[BindGroupLayoutEntry {
+            binding: 0,
+            visibility: ShaderStages::COMPUTE,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    })
+}
+
 /// Encodes a pass that sets `pipeline` with `backing_memory` and dispatches `inputs`.
 fn encode_dispatch(
     device: &Device,
@@ -259,19 +275,7 @@ fn backing_memory_unaligned_offset() {
 #[test]
 fn backing_memory_bound_as_storage() {
     let (device, _queue) = work_graph_device();
-    let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-        label: None,
-        entries: &[BindGroupLayoutEntry {
-            binding: 0,
-            visibility: ShaderStages::COMPUTE,
-            ty: BindingType::Buffer {
-                ty: BufferBindingType::Storage { read_only: false },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
-    });
+    let bind_group_layout = storage_bind_group_layout(&device);
     let pipeline = pipeline_with_layout(&device, &layout(&device, Some(&bind_group_layout)));
     let buffer = backing_memory(&device, MIN_BACKING_MEMORY_SIZE, BufferUsages::STORAGE);
     let bind_group = device.create_bind_group(&BindGroupDescriptor {
@@ -440,4 +444,286 @@ fn compute_pipeline_replaces_work_graph_pipeline() {
         }
         encoder.finish()
     });
+}
+
+fn gpu_input_buffer(device: &Device, size: u64, usage: BufferUsages) -> Buffer {
+    device.create_buffer(&BufferDescriptor {
+        label: Some("GPU input"),
+        size,
+        usage,
+        mapped_at_creation: false,
+    })
+}
+
+/// Encodes a pass that sets `pipeline` with `backing_memory` and dispatches the GPU input that
+/// `input` holds at `offset`.
+fn encode_dispatch_indirect(
+    device: &Device,
+    pipeline: &WorkGraphPipeline,
+    backing_memory: BufferSlice<'_>,
+    input: &Buffer,
+    offset: BufferAddress,
+    mode: WorkGraphGpuInputMode,
+    referenced_buffers: &[&Buffer],
+) -> CommandBuffer {
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+        pass.set_work_graph_pipeline(pipeline, backing_memory);
+        unsafe { pass.dispatch_graph_indirect(input, offset, mode, referenced_buffers) };
+    }
+    encoder.finish()
+}
+
+#[test]
+fn gpu_input_layout() {
+    assert_eq!(WorkGraphGpuInputMode::SingleNode.input_size(), 24);
+    assert_eq!(WorkGraphGpuInputMode::MultiNode.input_size(), 24);
+
+    let input = WorkGraphGpuMultiNodeInput::new(2, 0x1000, 24);
+    assert_eq!(input.as_bytes()[..4], 2u32.to_le_bytes());
+    assert_eq!(input.as_bytes()[8..16], 0x1000u64.to_le_bytes());
+}
+
+#[test]
+fn dispatch_indirect_valid() {
+    let (device, _queue) = work_graph_device();
+    let pipeline = pipeline(&device);
+    let memory = backing_memory(&device, MIN_BACKING_MEMORY_SIZE, BufferUsages::STORAGE);
+    let input = gpu_input_buffer(&device, 48, BufferUsages::STORAGE);
+    let records = gpu_input_buffer(&device, 64, BufferUsages::STORAGE);
+
+    valid(&device, || {
+        encode_dispatch_indirect(
+            &device,
+            &pipeline,
+            memory.slice(..),
+            &input,
+            0,
+            WorkGraphGpuInputMode::SingleNode,
+            &[&records],
+        )
+    });
+    valid(&device, || {
+        encode_dispatch_indirect(
+            &device,
+            &pipeline,
+            memory.slice(..),
+            &input,
+            24,
+            WorkGraphGpuInputMode::MultiNode,
+            &[&input, &records],
+        )
+    });
+}
+
+#[test]
+fn dispatch_indirect_without_work_graph_pipeline() {
+    let (device, _queue) = work_graph_device();
+    let input = gpu_input_buffer(&device, 24, BufferUsages::STORAGE);
+    fail(
+        &device,
+        || {
+            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+            {
+                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+                unsafe {
+                    pass.dispatch_graph_indirect(&input, 0, WorkGraphGpuInputMode::SingleNode, &[])
+                };
+            }
+            encoder.finish()
+        },
+        Some("Work graph pipeline must be set"),
+    );
+}
+
+#[test]
+fn dispatch_indirect_requires_storage_usage() {
+    let (device, _queue) = work_graph_device();
+    let pipeline = pipeline(&device);
+    let memory = backing_memory(&device, MIN_BACKING_MEMORY_SIZE, BufferUsages::STORAGE);
+    let storage = gpu_input_buffer(&device, 24, BufferUsages::STORAGE);
+    let indirect = gpu_input_buffer(&device, 24, BufferUsages::INDIRECT);
+
+    fail(
+        &device,
+        || {
+            encode_dispatch_indirect(
+                &device,
+                &pipeline,
+                memory.slice(..),
+                &indirect,
+                0,
+                WorkGraphGpuInputMode::SingleNode,
+                &[],
+            )
+        },
+        Some("STORAGE"),
+    );
+    fail(
+        &device,
+        || {
+            encode_dispatch_indirect(
+                &device,
+                &pipeline,
+                memory.slice(..),
+                &storage,
+                0,
+                WorkGraphGpuInputMode::SingleNode,
+                &[&indirect],
+            )
+        },
+        Some("STORAGE"),
+    );
+}
+
+#[test]
+fn dispatch_indirect_unaligned_offset() {
+    let (device, _queue) = work_graph_device();
+    let pipeline = pipeline(&device);
+    let memory = backing_memory(&device, MIN_BACKING_MEMORY_SIZE, BufferUsages::STORAGE);
+    let input = gpu_input_buffer(&device, 48, BufferUsages::STORAGE);
+    fail(
+        &device,
+        || {
+            encode_dispatch_indirect(
+                &device,
+                &pipeline,
+                memory.slice(..),
+                &input,
+                4,
+                WorkGraphGpuInputMode::SingleNode,
+                &[],
+            )
+        },
+        Some("GPU input offset 4 is not a multiple of 8"),
+    );
+}
+
+#[test]
+fn dispatch_indirect_overrun() {
+    let (device, _queue) = work_graph_device();
+    let pipeline = pipeline(&device);
+    let memory = backing_memory(&device, MIN_BACKING_MEMORY_SIZE, BufferUsages::STORAGE);
+    let input = gpu_input_buffer(&device, 32, BufferUsages::STORAGE);
+    fail(
+        &device,
+        || {
+            encode_dispatch_indirect(
+                &device,
+                &pipeline,
+                memory.slice(..),
+                &input,
+                16,
+                WorkGraphGpuInputMode::MultiNode,
+                &[],
+            )
+        },
+        Some("would overrun buffer of size 32"),
+    );
+}
+
+#[test]
+fn dispatch_indirect_destroyed_referenced_buffer() {
+    let (device, queue) = work_graph_device();
+    let pipeline = pipeline(&device);
+    let memory = backing_memory(&device, MIN_BACKING_MEMORY_SIZE, BufferUsages::STORAGE);
+    let input = gpu_input_buffer(&device, 24, BufferUsages::STORAGE);
+    let records = gpu_input_buffer(&device, 64, BufferUsages::STORAGE);
+    records.destroy();
+    fail(
+        &device,
+        || {
+            queue.submit([encode_dispatch_indirect(
+                &device,
+                &pipeline,
+                memory.slice(..),
+                &input,
+                0,
+                WorkGraphGpuInputMode::SingleNode,
+                &[&records],
+            )])
+        },
+        Some("has been destroyed"),
+    );
+}
+
+#[test]
+fn dispatch_indirect_references_backing_memory() {
+    let (device, _queue) = work_graph_device();
+    let pipeline = pipeline(&device);
+    let memory = backing_memory(&device, 2 * MIN_BACKING_MEMORY_SIZE, BufferUsages::STORAGE);
+    let input = gpu_input_buffer(&device, 24, BufferUsages::STORAGE);
+    fail(
+        &device,
+        || {
+            encode_dispatch_indirect(
+                &device,
+                &pipeline,
+                memory.slice(..MIN_BACKING_MEMORY_SIZE),
+                &input,
+                0,
+                WorkGraphGpuInputMode::SingleNode,
+                &[&memory],
+            )
+        },
+        Some("WORK_GRAPH_BACKING_MEMORY"),
+    );
+}
+
+#[test]
+fn dispatch_indirect_input_bound_as_storage() {
+    let (device, _queue) = work_graph_device();
+    let bind_group_layout = storage_bind_group_layout(&device);
+    let pipeline = pipeline_with_layout(&device, &layout(&device, Some(&bind_group_layout)));
+    let memory = backing_memory(&device, MIN_BACKING_MEMORY_SIZE, BufferUsages::STORAGE);
+    let input = gpu_input_buffer(&device, 24, BufferUsages::STORAGE);
+    let bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: None,
+        layout: &bind_group_layout,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: input.as_entire_binding(),
+        }],
+    });
+
+    fail(
+        &device,
+        || {
+            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+            {
+                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+                pass.set_work_graph_pipeline(&pipeline, memory.slice(..));
+                pass.set_bind_group(0, &bind_group, &[]);
+                unsafe {
+                    pass.dispatch_graph_indirect(&input, 0, WorkGraphGpuInputMode::SingleNode, &[])
+                };
+            }
+            encoder.finish()
+        },
+        Some("STORAGE_READ_ONLY"),
+    );
+}
+
+#[test]
+fn work_graph_input_address() {
+    let (device, _queue) = work_graph_device();
+    let buffer = gpu_input_buffer(&device, 24, BufferUsages::STORAGE);
+    valid(&device, || buffer.work_graph_input_address());
+}
+
+#[test]
+#[should_panic(expected = "EXPERIMENTAL_WORK_GRAPHS")]
+fn work_graph_input_address_requires_feature() {
+    let (device, _queue) = device(Features::empty());
+    let buffer = gpu_input_buffer(&device, 24, BufferUsages::STORAGE);
+    buffer.work_graph_input_address();
+}
+
+#[test]
+#[should_panic(expected = "STORAGE")]
+fn work_graph_input_address_requires_storage_usage() {
+    let (device, _queue) = work_graph_device();
+    let buffer = gpu_input_buffer(&device, 24, BufferUsages::INDIRECT);
+    buffer.work_graph_input_address();
 }

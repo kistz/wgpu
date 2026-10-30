@@ -48,6 +48,15 @@ pub enum ComputeCommand<R: ReferenceType> {
         inputs: Vec<wgt::WorkGraphNodeInput<Vec<u8>>>,
     },
 
+    /// Dispatch a work graph with input in GPU memory.
+    DispatchGraphIndirect {
+        buffer: R::Buffer,
+        offset: wgt::BufferAddress,
+        mode: wgt::WorkGraphGpuInputMode,
+        /// Buffers that the input references.
+        referenced_buffers: Vec<R::Buffer>,
+    },
+
     PushDebugGroup {
         color: u32,
         len: usize,

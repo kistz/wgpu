@@ -133,6 +133,7 @@ pub trait DynDevice: DynResource {
         desc: &WorkGraphPipelineDescriptor<dyn DynPipelineLayout, dyn DynShaderModule>,
     ) -> Result<(Box<dyn DynWorkGraphPipeline>, WorkGraphPipelineInfo), PipelineError>;
     unsafe fn destroy_work_graph_pipeline(&self, pipeline: Box<dyn DynWorkGraphPipeline>);
+    unsafe fn get_buffer_device_address(&self, buffer: &dyn DynBuffer) -> wgt::BufferAddress;
 
     unsafe fn create_pipeline_cache(
         &self,
@@ -534,6 +535,11 @@ impl<D: Device + DynResource> DynDevice for D {
 
     unsafe fn destroy_work_graph_pipeline(&self, pipeline: Box<dyn DynWorkGraphPipeline>) {
         unsafe { D::destroy_work_graph_pipeline(self, pipeline.unbox()) };
+    }
+
+    unsafe fn get_buffer_device_address(&self, buffer: &dyn DynBuffer) -> wgt::BufferAddress {
+        let buffer = buffer.expect_downcast_ref();
+        unsafe { D::get_buffer_device_address(self, buffer) }
     }
 
     unsafe fn create_pipeline_cache(

@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use crate::{
     api::{impl_deferred_command_buffer_actions, SharedDeferredCommandBufferActions},
     *,
@@ -135,6 +137,51 @@ impl ComputePass<'_> {
     /// an `SV_DispatchGrid` value must not exceed the node's `NodeMaxDispatchGrid`.
     pub unsafe fn dispatch_graph(&mut self, inputs: &[WorkGraphNodeInput<&[u8]>]) {
         unsafe { self.inner.dispatch_graph(inputs) };
+    }
+
+    /// Submits work graph input from GPU memory to entrypoints of the active work graph pipeline.
+    ///
+    /// `input_buffer` holds a [`WorkGraphGpuNodeInput`] or a [`WorkGraphGpuMultiNodeInput`] at
+    /// `input_offset`, as selected by `mode`. The input is read when the dispatch executes, so
+    /// it can be written by earlier GPU commands.
+    ///
+    /// The input refers to records and node inputs by their GPU address, which is
+    /// [`Buffer::work_graph_input_address`] plus the offset within the buffer.
+    /// `referenced_buffers` must list every buffer that the input refers to, so that the buffers
+    /// are kept alive and synchronized with other commands. All of the buffers are used as
+    /// read-only storage by the dispatch, and must have [`BufferUsages::STORAGE`].
+    ///
+    /// `input_offset` must be a multiple of [`WORK_GRAPH_GPU_INPUT_ALIGNMENT`].
+    ///
+    /// # Safety
+    ///
+    /// When the dispatch executes, the input must be valid:
+    ///
+    /// - It must only refer to memory of `input_buffer` and `referenced_buffers`, and every
+    ///   record it refers to must be complete.
+    /// - Entrypoint indices must be valid, and the addresses and strides must satisfy the
+    ///   requirements documented on [`WorkGraphGpuNodeInput`] and [`WorkGraphGpuMultiNodeInput`].
+    /// - The records must not violate limits declared by the nodes receiving them. For example,
+    ///   an `SV_DispatchGrid` value must not exceed the node's `NodeMaxDispatchGrid`.
+    pub unsafe fn dispatch_graph_indirect(
+        &mut self,
+        input_buffer: &Buffer,
+        input_offset: BufferAddress,
+        mode: WorkGraphGpuInputMode,
+        referenced_buffers: &[&Buffer],
+    ) {
+        let referenced_buffers = referenced_buffers
+            .iter()
+            .map(|buffer| &buffer.inner)
+            .collect::<Vec<_>>();
+        unsafe {
+            self.inner.dispatch_graph_indirect(
+                &input_buffer.inner,
+                input_offset,
+                mode,
+                &referenced_buffers,
+            )
+        };
     }
 
     /// Transition resources to an underlying hal resource state. Compute pass version of

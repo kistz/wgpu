@@ -2633,6 +2633,10 @@ impl crate::Device for super::Device {
         unimplemented!("Work graphs are unsupported on Vulkan")
     }
 
+    unsafe fn get_buffer_device_address(&self, _buffer: &super::Buffer) -> wgt::BufferAddress {
+        unimplemented!("Work graphs are unsupported on Vulkan")
+    }
+
     unsafe fn create_pipeline_cache(
         &self,
         desc: &crate::PipelineCacheDescriptor<'_>,

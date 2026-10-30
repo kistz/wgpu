@@ -359,6 +359,23 @@ impl Buffer {
         self.inner.usage()
     }
 
+    /// Returns the GPU address of the start of the buffer, for use in work graph input in GPU
+    /// memory. See [`ComputePass::dispatch_graph_indirect`].
+    ///
+    /// The address does not change during the lifetime of the buffer.
+    ///
+    /// Requires [`Features::EXPERIMENTAL_WORK_GRAPHS`], and the buffer must have
+    /// [`BufferUsages::STORAGE`].
+    ///
+    /// # Panics
+    ///
+    /// - If the feature is not enabled.
+    /// - If the buffer does not have [`BufferUsages::STORAGE`].
+    /// - If the buffer is destroyed.
+    pub fn work_graph_input_address(&self) -> BufferAddress {
+        self.inner.work_graph_input_address()
+    }
+
     /// Map the buffer to host (CPU) memory, making it available for reading or writing via
     /// [`get_mapped_range()`](Self::get_mapped_range). The buffer becomes accessible once the
     /// `callback` is invoked with [`Ok`].

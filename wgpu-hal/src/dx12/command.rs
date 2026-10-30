@@ -1799,7 +1799,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
     }
 
     unsafe fn dispatch_graph(&mut self, desc: &crate::DispatchGraphDescriptor<super::Buffer>) {
-        if desc.inputs.is_empty() {
+        if let crate::DispatchGraphInputs::Cpu([]) = desc.inputs {
             return;
         }
 
@@ -1851,9 +1851,39 @@ impl crate::CommandEncoder for super::CommandEncoder {
             self.pass.bound_work_graph = Some(program);
         }
 
+        let inputs = match desc.inputs {
+            crate::DispatchGraphInputs::Cpu(inputs) => inputs,
+            crate::DispatchGraphInputs::Gpu {
+                buffer,
+                offset,
+                mode,
+            } => {
+                let address = unsafe { buffer.resource.GetGPUVirtualAddress() } + offset;
+                let dispatch_desc = match mode {
+                    wgt::WorkGraphGpuInputMode::SingleNode => {
+                        Direct3D12::D3D12_DISPATCH_GRAPH_DESC {
+                            Mode: Direct3D12::D3D12_DISPATCH_MODE_NODE_GPU_INPUT,
+                            Anonymous: Direct3D12::D3D12_DISPATCH_GRAPH_DESC_0 {
+                                NodeGPUInput: address,
+                            },
+                        }
+                    }
+                    wgt::WorkGraphGpuInputMode::MultiNode => {
+                        Direct3D12::D3D12_DISPATCH_GRAPH_DESC {
+                            Mode: Direct3D12::D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT,
+                            Anonymous: Direct3D12::D3D12_DISPATCH_GRAPH_DESC_0 {
+                                MultiNodeGPUInput: address,
+                            },
+                        }
+                    }
+                };
+                unsafe { list10.DispatchGraph(&dispatch_desc) };
+                return;
+            }
+        };
+
         // Records must be aligned to their largest scalar member, which is at most 8 bytes.
-        let records = desc
-            .inputs
+        let records = inputs
             .iter()
             .map(|input| {
                 let mut aligned = alloc::vec![0u64; input.records.len().div_ceil(8)];
@@ -1862,8 +1892,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 aligned
             })
             .collect::<Vec<_>>();
-        let node_inputs = desc
-            .inputs
+        let node_inputs = inputs
             .iter()
             .zip(&records)
             .map(|(input, records)| Direct3D12::D3D12_NODE_CPU_INPUT {

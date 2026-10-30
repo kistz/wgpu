@@ -486,6 +486,20 @@ impl IntoTrace for ArcComputeCommand {
                 offset,
             },
             C::DispatchGraph { inputs } => C::DispatchGraph { inputs },
+            C::DispatchGraphIndirect {
+                buffer,
+                offset,
+                mode,
+                referenced_buffers,
+            } => C::DispatchGraphIndirect {
+                buffer: buffer.into_trace(),
+                offset,
+                mode,
+                referenced_buffers: referenced_buffers
+                    .into_iter()
+                    .map(|buffer| buffer.into_trace())
+                    .collect(),
+            },
             C::PushDebugGroup { color, len } => C::PushDebugGroup { color, len },
             C::PopDebugGroup => C::PopDebugGroup,
             C::InsertDebugMarker { color, len } => C::InsertDebugMarker { color, len },

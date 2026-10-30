@@ -155,7 +155,7 @@ By @sagudev in [#10307](https://github.com/gfx-rs/wgpu/pull/10307).
 
 #### DX12
 
-- Add experimental work graph support with `Features::EXPERIMENTAL_WORK_GRAPHS`. Work graph pipelines are created from passthrough DXIL or HLSL shader libraries with `Device::create_work_graph_pipeline`, and run in a compute pass with `ComputePass::set_work_graph_pipeline` and `ComputePass::dispatch_graph`. DXIL passthrough shader modules may now have no entry points. By @kistz.
+- Add experimental work graph support with `Features::EXPERIMENTAL_WORK_GRAPHS`. Work graph pipelines are created from passthrough DXIL or HLSL shader libraries with `Device::create_work_graph_pipeline`, and run in a compute pass with `ComputePass::set_work_graph_pipeline` and `ComputePass::dispatch_graph`. `ComputePass::dispatch_graph_indirect` reads the input from GPU memory, which refers to records by `Buffer::work_graph_input_address`. DXIL passthrough shader modules may now have no entry points. By @kistz.
 
 #### Metal
 

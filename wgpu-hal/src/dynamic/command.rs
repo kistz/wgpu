@@ -5,9 +5,9 @@ use crate::{
     AccelerationStructureBarrier, Api, Attachment, BufferBarrier, BufferBinding, BufferCopy,
     BufferTextureCopy, BuildAccelerationStructureDescriptor, ColorAttachment, CommandEncoder,
     ComputePassDescriptor, DepthStencilAttachment, DeviceError, DispatchGraphDescriptor,
-    DynRayTracingPipeline, DynWorkGraphPipeline, Label, MemoryRange, PassTimestampWrites,
-    RayTracingPassDescriptor, Rect, RenderPassDescriptor, TextureBarrier, TextureCopy,
-    WorkGraphBackingMemory,
+    DispatchGraphInputs, DynRayTracingPipeline, DynWorkGraphPipeline, Label, MemoryRange,
+    PassTimestampWrites, RayTracingPassDescriptor, Rect, RenderPassDescriptor, TextureBarrier,
+    TextureCopy, WorkGraphBackingMemory,
 };
 
 use super::{
@@ -655,7 +655,18 @@ impl<C: CommandEncoder + DynResource> DynCommandEncoder for C {
                 size: desc.backing_memory.size,
             },
             initialize: desc.initialize,
-            inputs: desc.inputs,
+            inputs: match desc.inputs {
+                DispatchGraphInputs::Cpu(inputs) => DispatchGraphInputs::Cpu(inputs),
+                DispatchGraphInputs::Gpu {
+                    buffer,
+                    offset,
+                    mode,
+                } => DispatchGraphInputs::Gpu {
+                    buffer: buffer.expect_downcast_ref(),
+                    offset,
+                    mode,
+                },
+            },
         };
         unsafe { C::dispatch_graph(self, &desc) };
     }

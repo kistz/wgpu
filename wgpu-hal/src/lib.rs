@@ -1196,6 +1196,12 @@ pub trait Device: WasmNotSendSync {
     ) -> Result<(<Self::A as Api>::WorkGraphPipeline, WorkGraphPipelineInfo), PipelineError>;
     unsafe fn destroy_work_graph_pipeline(&self, pipeline: <Self::A as Api>::WorkGraphPipeline);
 
+    /// Returns the GPU address of `buffer`, for use in work graph input in GPU memory.
+    unsafe fn get_buffer_device_address(
+        &self,
+        buffer: &<Self::A as Api>::Buffer,
+    ) -> wgt::BufferAddress;
+
     unsafe fn create_pipeline_cache(
         &self,
         desc: &PipelineCacheDescriptor<'_>,
@@ -1932,6 +1938,9 @@ pub trait CommandEncoder: WasmNotSendSync + fmt::Debug {
     ///   enough correctly strided record data for its records.
     /// - The input records must not violate any limits declared by the receiving nodes, such as
     ///   `SV_DispatchGrid` exceeding `NodeMaxDispatchGrid`.
+    /// - For [`DispatchGraphInputs::Gpu`], the input must be valid when the dispatch executes,
+    ///   its offset must be a multiple of [`wgt::WORK_GRAPH_GPU_INPUT_ALIGNMENT`], and it must only
+    ///   reference memory of buffers that are in the [`wgt::BufferUses::STORAGE_READ_ONLY`] state.
     ///
     /// [`set_work_graph_pipeline`]: CommandEncoder::set_work_graph_pipeline
     /// [`set_compute_pipeline`]: CommandEncoder::set_compute_pipeline
@@ -3320,12 +3329,23 @@ pub struct WorkGraphBackingMemory<'a, B: DynBuffer + ?Sized> {
 }
 
 #[derive(Debug)]
+pub enum DispatchGraphInputs<'a, B: DynBuffer + ?Sized> {
+    /// Input records for one or more entrypoints.
+    Cpu(&'a [wgt::WorkGraphNodeInput<&'a [u8]>]),
+    /// Input in GPU memory, which is read when the dispatch executes.
+    Gpu {
+        buffer: &'a B,
+        offset: wgt::BufferAddress,
+        mode: wgt::WorkGraphGpuInputMode,
+    },
+}
+
+#[derive(Debug)]
 pub struct DispatchGraphDescriptor<'a, B: DynBuffer + ?Sized> {
     pub backing_memory: WorkGraphBackingMemory<'a, B>,
     /// Initialize the backing memory before dispatching.
     pub initialize: bool,
-    /// Input records for one or more entrypoints.
-    pub inputs: &'a [wgt::WorkGraphNodeInput<&'a [u8]>],
+    pub inputs: DispatchGraphInputs<'a, B>,
 }
 
 #[derive(Debug)]

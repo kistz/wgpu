@@ -1,5 +1,6 @@
 use alloc::borrow::Cow;
 
+use bytemuck::{Pod, Zeroable};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -7,6 +8,9 @@ use crate::BufferAddress;
 
 /// Required alignment of the offset of a work graph's backing memory.
 pub const WORK_GRAPH_BACKING_MEMORY_ALIGNMENT: BufferAddress = 8;
+
+/// Required alignment of the offset of work graph input in GPU memory.
+pub const WORK_GRAPH_GPU_INPUT_ALIGNMENT: BufferAddress = 8;
 
 /// Identifies a node of a work graph by its name and its index in the node array.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -87,4 +91,99 @@ pub struct WorkGraphNodeInput<R> {
     pub record_stride: u64,
     /// The record data.
     pub records: R,
+}
+
+/// The layout of work graph input in GPU memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum WorkGraphGpuInputMode {
+    /// The input is a [`WorkGraphGpuNodeInput`].
+    SingleNode,
+    /// The input is a [`WorkGraphGpuMultiNodeInput`].
+    MultiNode,
+}
+
+impl WorkGraphGpuInputMode {
+    /// Size in bytes of the input.
+    #[must_use]
+    pub const fn input_size(self) -> BufferAddress {
+        match self {
+            Self::SingleNode => size_of::<WorkGraphGpuNodeInput>() as BufferAddress,
+            Self::MultiNode => size_of::<WorkGraphGpuMultiNodeInput>() as BufferAddress,
+        }
+    }
+}
+
+/// GPU memory layout of input records for one entrypoint of a work graph.
+///
+/// The address of this struct must be a multiple of [`WORK_GRAPH_GPU_INPUT_ALIGNMENT`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Pod, Zeroable)]
+pub struct WorkGraphGpuNodeInput {
+    /// Index of the entrypoint in the entrypoints of the work graph pipeline.
+    pub entrypoint_index: u32,
+    /// Number of records to submit to the entrypoint.
+    pub num_records: u32,
+    /// GPU address of the first record.
+    ///
+    /// The address and `record_stride` must be multiples of the entrypoint's
+    /// [`WorkGraphEntrypoint::record_stride_alignment`].
+    pub records_address: u64,
+    /// Distance in bytes between the starts of consecutive records.
+    ///
+    /// If this is zero, the first record is submitted `num_records` times. Otherwise it must be at
+    /// least the entrypoint's [`WorkGraphEntrypoint::record_size`].
+    pub record_stride: u64,
+}
+
+impl WorkGraphGpuNodeInput {
+    /// Returns the bytes representation of the struct, ready to be written into a buffer.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        bytemuck::bytes_of(self)
+    }
+}
+
+/// GPU memory layout of input records for several entrypoints of a work graph.
+///
+/// The address of this struct must be a multiple of [`WORK_GRAPH_GPU_INPUT_ALIGNMENT`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Pod, Zeroable)]
+pub struct WorkGraphGpuMultiNodeInput {
+    /// Number of [`WorkGraphGpuNodeInput`]s.
+    pub num_node_inputs: u32,
+    _padding: u32,
+    /// GPU address of the first [`WorkGraphGpuNodeInput`].
+    ///
+    /// The address and `node_inputs_stride` must be multiples of
+    /// [`WORK_GRAPH_GPU_INPUT_ALIGNMENT`].
+    pub node_inputs_address: u64,
+    /// Distance in bytes between the starts of consecutive [`WorkGraphGpuNodeInput`]s.
+    ///
+    /// If this is zero, the first node input is used `num_node_inputs` times. Otherwise it must
+    /// be at least the size of [`WorkGraphGpuNodeInput`].
+    pub node_inputs_stride: u64,
+}
+
+impl WorkGraphGpuMultiNodeInput {
+    /// Creates a multi node input.
+    #[must_use]
+    pub const fn new(
+        num_node_inputs: u32,
+        node_inputs_address: u64,
+        node_inputs_stride: u64,
+    ) -> Self {
+        Self {
+            num_node_inputs,
+            _padding: 0,
+            node_inputs_address,
+            node_inputs_stride,
+        }
+    }
+
+    /// Returns the bytes representation of the struct, ready to be written into a buffer.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        bytemuck::bytes_of(self)
+    }
 }

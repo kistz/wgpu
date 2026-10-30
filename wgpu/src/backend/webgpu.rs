@@ -3185,6 +3185,10 @@ impl dispatch::BufferInterface for WebBuffer {
     fn usage(&self) -> crate::BufferUsages {
         self.usage
     }
+
+    fn work_graph_input_address(&self) -> crate::BufferAddress {
+        unimplemented!("Work graphs are not implemented for web")
+    }
 }
 impl Drop for WebBuffer {
     fn drop(&mut self) {
@@ -3815,6 +3819,16 @@ impl dispatch::ComputePassInterface for WebComputePassEncoder {
     }
 
     unsafe fn dispatch_graph(&mut self, _inputs: &[wgt::WorkGraphNodeInput<&[u8]>]) {
+        unimplemented!("Work graphs are not implemented for web")
+    }
+
+    unsafe fn dispatch_graph_indirect(
+        &mut self,
+        _input_buffer: &dispatch::DispatchBuffer,
+        _input_offset: crate::BufferAddress,
+        _mode: wgt::WorkGraphGpuInputMode,
+        _referenced_buffers: &[&dispatch::DispatchBuffer],
+    ) {
         unimplemented!("Work graphs are not implemented for web")
     }
 

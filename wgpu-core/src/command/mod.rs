@@ -2057,8 +2057,8 @@ pub enum PassErrorScope {
     Dispatch { indirect: bool },
     #[error("In a set_work_graph_pipeline command")]
     SetPipelineWorkGraph,
-    #[error("In a dispatch_graph command")]
-    DispatchGraph,
+    #[error("In a dispatch_graph command, indirect:{indirect}")]
+    DispatchGraph { indirect: bool },
     #[error("In a push_debug_group command")]
     PushDebugGroup,
     #[error("In a pop_debug_group command")]

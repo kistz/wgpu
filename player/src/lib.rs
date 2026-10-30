@@ -1056,6 +1056,20 @@ impl Player {
                 offset,
             },
             C::DispatchGraph { inputs } => C::DispatchGraph { inputs },
+            C::DispatchGraphIndirect {
+                buffer,
+                offset,
+                mode,
+                referenced_buffers,
+            } => C::DispatchGraphIndirect {
+                buffer: self.resolve_buffer_id(buffer),
+                offset,
+                mode,
+                referenced_buffers: referenced_buffers
+                    .into_iter()
+                    .map(|buffer| self.resolve_buffer_id(buffer))
+                    .collect(),
+            },
             C::PushDebugGroup { color, len } => C::PushDebugGroup { color, len },
             C::PopDebugGroup => C::PopDebugGroup,
             C::InsertDebugMarker { color, len } => C::InsertDebugMarker { color, len },
