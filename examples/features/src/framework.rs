@@ -76,6 +76,9 @@ fn init_logger() {
             // of these default filters.
             env_logger::builder()
                 .filter_level(log::LevelFilter::Info)
+                // Millisecond timestamps; see
+                // <https://github.com/gfx-rs/wgpu/issues/9248>.
+                .format_timestamp_millis()
                 .parse_default_env()
                 .init();
         }
@@ -290,6 +293,7 @@ impl ExampleContext {
                 required_features: (E::optional_features() & adapter.features())
                     | E::required_features(),
                 required_limits: needed_limits,
+                default_queue: wgpu::QueueDescriptor { label: None },
                 experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
                 memory_hints: wgpu::MemoryHints::MemoryUsage,
                 trace: match std::env::var_os("WGPU_TRACE") {
@@ -525,17 +529,6 @@ impl<E: Example> ApplicationHandler<AppAction> for App<E> {
             }
             | WindowEvent::CloseRequested => {
                 event_loop.exit();
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        logical_key: Key::Character(s),
-                        ..
-                    },
-                ..
-            } if s == "r" => {
-                println!("{:#?}", context.instance.generate_report());
             }
             WindowEvent::RedrawRequested => {
                 // Don't render while occluded, this may leak on apple platforms.

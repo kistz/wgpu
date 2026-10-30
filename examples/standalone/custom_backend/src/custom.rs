@@ -337,7 +337,7 @@ impl QueueInterface for CustomQueue {
         &self,
         _buffer: &wgpu::custom::DispatchBuffer,
         _offset: wgpu::BufferAddress,
-        _staging_buffer: &wgpu::custom::DispatchQueueWriteBuffer,
+        _staging_buffer: wgpu::custom::DispatchQueueWriteBuffer,
     ) {
         unimplemented!()
     }
@@ -355,7 +355,7 @@ impl QueueInterface for CustomQueue {
     fn submit(
         &self,
         _command_buffers: &mut dyn Iterator<Item = wgpu::custom::DispatchCommandBuffer>,
-    ) -> u64 {
+    ) -> Option<u64> {
         unimplemented!()
     }
 

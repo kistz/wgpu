@@ -18,7 +18,6 @@ use std::{
     fs::{read_to_string, File},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    slice,
     sync::Arc,
 };
 use wgc::{command::PointerReferences, device::trace::DiskTraceLoader};
@@ -55,7 +54,7 @@ struct Test<'a> {
     actions: Vec<wgc::device::trace::Action<'a, PointerReferences>>,
 }
 
-fn map_callback(status: Result<(), wgc::resource::BufferAccessError>) {
+fn map_callback(status: Result<wgt::MapMode, wgc::resource::BufferAccessError>) {
     if let Err(e) = status {
         panic!("Buffer map error: {e}");
     }
@@ -74,24 +73,17 @@ impl Test<'_> {
         ron::de::from_str(&string).unwrap_or_else(|e| panic!("{path:?}:{} {}", e.span, e.code))
     }
 
-    fn run(
-        self,
-        dir: &Path,
-        instance_flags: wgt::InstanceFlags,
-        adapter: Arc<wgc::instance::Adapter>,
-    ) {
+    fn run(self, dir: &Path, adapter: Arc<wgc::instance::Adapter>) {
         let (device, queue) = adapter
-            .create_device_and_queue(
-                &wgt::DeviceDescriptor {
-                    label: None,
-                    required_features: self.features,
-                    required_limits: wgt::Limits::default(),
-                    experimental_features: unsafe { wgt::ExperimentalFeatures::enabled() },
-                    memory_hints: wgt::MemoryHints::default(),
-                    trace: wgt::Trace::Off,
-                },
-                instance_flags,
-            )
+            .request_device(&wgt::DeviceDescriptor {
+                label: None,
+                required_features: self.features,
+                required_limits: wgt::Limits::default(),
+                default_queue: wgt::QueueDescriptor { label: None },
+                experimental_features: unsafe { wgt::ExperimentalFeatures::enabled() },
+                memory_hints: wgt::MemoryHints::default(),
+                trace: wgt::Trace::Off,
+            })
             .unwrap();
 
         let mut player = Player::default();
@@ -105,12 +97,10 @@ impl Test<'_> {
             player
                 .resolve_buffer_id(expect.buffer)
                 .map_async(
+                    wgt::MapMode::Read,
                     expect.offset,
                     Some(expect.data.len() as u64),
-                    wgc::resource::BufferMapOperation {
-                        host: wgc::device::HostMap::Read,
-                        callback: Some(Box::new(map_callback)),
-                    },
+                    Some(Box::new(map_callback)),
                 )
                 .unwrap();
         }
@@ -125,11 +115,10 @@ impl Test<'_> {
 
         for expect in self.expectations {
             println!("\t\t\tChecking {}", expect.name);
-            let (ptr, size) = player
+            let mapping = player
                 .resolve_buffer_id(expect.buffer)
                 .get_mapped_range(expect.offset, Some(expect.data.len() as wgt::BufferAddress))
                 .unwrap();
-            let contents = unsafe { slice::from_raw_parts(ptr.as_ptr(), size as usize) };
             let expected_data = match expect.data {
                 ExpectedData::Raw(vec) => vec,
                 ExpectedData::File(name, size) => {
@@ -146,11 +135,13 @@ impl Test<'_> {
                     .collect::<Vec<u8>>(),
             };
 
-            if &expected_data[..] != contents {
+            let contents = mapping.read_slice().to_vec();
+            if expected_data[..] != contents {
                 panic!(
                     "Test expectation is not met!\nBuffer content was:\n{contents:?}\nbut expected:\n{expected_data:?}"
                 );
             }
+            drop(mapping);
         }
     }
 }
@@ -182,13 +173,12 @@ impl Corpus {
                 println!("\t\tTest '{test_path:?}'");
 
                 let instance_desc = wgt::InstanceDescriptor::new_without_display_handle_from_env();
-                let instance_flags = instance_desc.flags;
                 let instance = wgc::instance::Instance::new("test", instance_desc, None);
                 let adapter = match instance.request_adapter(
                     &wgt::RequestAdapterOptions::default(),
                     wgt::Backends::from(backend),
                 ) {
-                    Ok(adapter) => Arc::new(adapter),
+                    Ok(adapter) => adapter,
                     Err(_) => continue,
                 };
 
@@ -211,16 +201,23 @@ impl Corpus {
                     println!("\t\tSkipped due to missing compute shader capability");
                     continue;
                 }
-                test.run(dir, instance_flags, adapter);
+                test.run(dir, adapter);
             }
         }
     }
 }
 
-#[cfg_attr(miri, ignore)]
-#[test]
-fn test_api() {
-    env_logger::init();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn test_api() {
+        // Millisecond timestamps; see <https://github.com/gfx-rs/wgpu/issues/9248>.
+        env_logger::builder().format_timestamp_millis().init();
 
-    Corpus::run_from(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/player/data/all.ron"))
+        Corpus::run_from(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/player/data/all.ron"),
+        )
+    }
 }

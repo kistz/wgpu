@@ -1,49 +1,49 @@
-@group(0) @binding(0) 
+@group(0) @binding(0)
 var image_mipmapped_src: texture_2d<u32>;
-@group(0) @binding(3) 
+@group(0) @binding(3)
 var image_multisampled_src: texture_multisampled_2d<u32>;
-@group(0) @binding(4) 
+@group(0) @binding(4)
 var image_depth_multisampled_src: texture_depth_multisampled_2d;
-@group(0) @binding(1) 
+@group(0) @binding(1)
 var image_storage_src: texture_storage_2d<rgba8uint,read>;
-@group(0) @binding(5) 
+@group(0) @binding(5)
 var image_array_src: texture_2d_array<u32>;
-@group(0) @binding(6) 
+@group(0) @binding(6)
 var image_dup_src: texture_storage_1d<r32uint,read>;
-@group(0) @binding(7) 
+@group(0) @binding(7)
 var image_1d_src: texture_1d<u32>;
-@group(0) @binding(2) 
+@group(0) @binding(2)
 var image_dst: texture_storage_1d<r32uint,write>;
-@group(0) @binding(0) 
+@group(0) @binding(0)
 var image_1d: texture_1d<f32>;
-@group(0) @binding(1) 
+@group(0) @binding(1)
 var image_2d: texture_2d<f32>;
-@group(0) @binding(2) 
+@group(0) @binding(2)
 var image_2d_u32_: texture_2d<u32>;
-@group(0) @binding(3) 
+@group(0) @binding(3)
 var image_2d_i32_: texture_2d<i32>;
-@group(0) @binding(4) 
+@group(0) @binding(4)
 var image_2d_array: texture_2d_array<f32>;
-@group(0) @binding(5) 
+@group(0) @binding(5)
 var image_cube: texture_cube<f32>;
-@group(0) @binding(6) 
+@group(0) @binding(6)
 var image_cube_array: texture_cube_array<f32>;
-@group(0) @binding(7) 
+@group(0) @binding(7)
 var image_3d: texture_3d<f32>;
-@group(0) @binding(8) 
+@group(0) @binding(8)
 var image_aa: texture_multisampled_2d<f32>;
-@group(1) @binding(0) 
+@group(1) @binding(0)
 var sampler_reg: sampler;
-@group(1) @binding(1) 
+@group(1) @binding(1)
 var sampler_cmp: sampler_comparison;
-@group(1) @binding(2) 
+@group(1) @binding(2)
 var image_2d_depth: texture_depth_2d;
-@group(1) @binding(3) 
+@group(1) @binding(3)
 var image_2d_array_depth: texture_depth_2d_array;
-@group(1) @binding(4) 
+@group(1) @binding(4)
 var image_cube_depth: texture_depth_cube;
 
-@compute @workgroup_size(16, 1, 1) 
+@compute @workgroup_size(16, 1, 1)
 fn main(@builtin(local_invocation_id) local_id: vec3<u32>) {
     let dim = textureDimensions(image_storage_src);
     let itc = (vec2<i32>((dim * local_id.xy)) % vec2<i32>(10i, 20i));
@@ -68,7 +68,7 @@ fn main(@builtin(local_invocation_id) local_id: vec3<u32>) {
     return;
 }
 
-@compute @workgroup_size(16, 1, 1) 
+@compute @workgroup_size(16, 1, 1)
 fn depth_load(@builtin(local_invocation_id) local_id_1: vec3<u32>) {
     let dim_1 = textureDimensions(image_storage_src);
     let itc_1 = (vec2<i32>((dim_1 * local_id_1.xy)) % vec2<i32>(10i, 20i));
@@ -77,7 +77,7 @@ fn depth_load(@builtin(local_invocation_id) local_id_1: vec3<u32>) {
     return;
 }
 
-@vertex 
+@vertex
 fn queries() -> @builtin(position) vec4<f32> {
     let dim_1d = textureDimensions(image_1d);
     let dim_1d_lod = textureDimensions(image_1d, i32(dim_1d));
@@ -96,7 +96,7 @@ fn queries() -> @builtin(position) vec4<f32> {
     return vec4(f32(sum));
 }
 
-@vertex 
+@vertex
 fn levels_queries() -> @builtin(position) vec4<f32> {
     let num_levels_2d = textureNumLevels(image_2d);
     let num_layers_2d = textureNumLayers(image_2d_array);
@@ -111,7 +111,7 @@ fn levels_queries() -> @builtin(position) vec4<f32> {
     return vec4(f32(sum_1));
 }
 
-@fragment 
+@fragment
 fn texture_sample() -> @location(0) vec4<f32> {
     var a: vec4<f32>;
 
@@ -137,61 +137,76 @@ fn texture_sample() -> @location(0) vec4<f32> {
     let _e41 = textureSampleBias(image_2d, sampler_reg, _e1, 2f, vec2<i32>(3i, 1i));
     a = (_e37 + _e41);
     let _e43 = a;
-    let _e46 = textureSampleBaseClampToEdge(image_2d, sampler_reg, _e1);
+    let _e46 = textureSampleGrad(image_2d, sampler_reg, _e1, _e1, _e1);
     a = (_e43 + _e46);
     let _e48 = a;
-    let _e52 = textureSample(image_2d_array, sampler_reg, _e1, 0u);
-    a = (_e48 + _e52);
-    let _e54 = a;
-    let _e58 = textureSample(image_2d_array, sampler_reg, _e1, 0u, vec2<i32>(3i, 1i));
-    a = (_e54 + _e58);
-    let _e60 = a;
-    let _e64 = textureSampleLevel(image_2d_array, sampler_reg, _e1, 0u, 2.3f);
-    a = (_e60 + _e64);
-    let _e66 = a;
-    let _e70 = textureSampleLevel(image_2d_array, sampler_reg, _e1, 0u, 2.3f, vec2<i32>(3i, 1i));
-    a = (_e66 + _e70);
-    let _e72 = a;
-    let _e77 = textureSampleBias(image_2d_array, sampler_reg, _e1, 0u, 2f, vec2<i32>(3i, 1i));
-    a = (_e72 + _e77);
-    let _e79 = a;
-    let _e83 = textureSample(image_2d_array, sampler_reg, _e1, 0i);
-    a = (_e79 + _e83);
-    let _e85 = a;
-    let _e89 = textureSample(image_2d_array, sampler_reg, _e1, 0i, vec2<i32>(3i, 1i));
-    a = (_e85 + _e89);
-    let _e91 = a;
-    let _e95 = textureSampleLevel(image_2d_array, sampler_reg, _e1, 0i, 2.3f);
-    a = (_e91 + _e95);
-    let _e97 = a;
-    let _e101 = textureSampleLevel(image_2d_array, sampler_reg, _e1, 0i, 2.3f, vec2<i32>(3i, 1i));
-    a = (_e97 + _e101);
-    let _e103 = a;
-    let _e108 = textureSampleBias(image_2d_array, sampler_reg, _e1, 0i, 2f, vec2<i32>(3i, 1i));
-    a = (_e103 + _e108);
-    let _e110 = a;
-    let _e114 = textureSample(image_cube_array, sampler_reg, _e3, 0u);
-    a = (_e110 + _e114);
-    let _e116 = a;
-    let _e120 = textureSampleLevel(image_cube_array, sampler_reg, _e3, 0u, 2.3f);
-    a = (_e116 + _e120);
-    let _e122 = a;
-    let _e127 = textureSampleBias(image_cube_array, sampler_reg, _e3, 0u, 2f);
-    a = (_e122 + _e127);
-    let _e129 = a;
-    let _e133 = textureSample(image_cube_array, sampler_reg, _e3, 0i);
-    a = (_e129 + _e133);
-    let _e135 = a;
-    let _e139 = textureSampleLevel(image_cube_array, sampler_reg, _e3, 0i, 2.3f);
-    a = (_e135 + _e139);
-    let _e141 = a;
-    let _e146 = textureSampleBias(image_cube_array, sampler_reg, _e3, 0i, 2f);
-    a = (_e141 + _e146);
-    let _e148 = a;
-    return _e148;
+    let _e51 = textureSampleBaseClampToEdge(image_2d, sampler_reg, _e1);
+    a = (_e48 + _e51);
+    let _e53 = a;
+    let _e57 = textureSample(image_2d_array, sampler_reg, _e1, 0u);
+    a = (_e53 + _e57);
+    let _e59 = a;
+    let _e63 = textureSample(image_2d_array, sampler_reg, _e1, 0u, vec2<i32>(3i, 1i));
+    a = (_e59 + _e63);
+    let _e65 = a;
+    let _e69 = textureSampleLevel(image_2d_array, sampler_reg, _e1, 0u, 2.3f);
+    a = (_e65 + _e69);
+    let _e71 = a;
+    let _e75 = textureSampleLevel(image_2d_array, sampler_reg, _e1, 0u, 2.3f, vec2<i32>(3i, 1i));
+    a = (_e71 + _e75);
+    let _e77 = a;
+    let _e82 = textureSampleBias(image_2d_array, sampler_reg, _e1, 0u, 2f, vec2<i32>(3i, 1i));
+    a = (_e77 + _e82);
+    let _e84 = a;
+    let _e88 = textureSample(image_2d_array, sampler_reg, _e1, 0i);
+    a = (_e84 + _e88);
+    let _e90 = a;
+    let _e94 = textureSample(image_2d_array, sampler_reg, _e1, 0i, vec2<i32>(3i, 1i));
+    a = (_e90 + _e94);
+    let _e96 = a;
+    let _e100 = textureSampleLevel(image_2d_array, sampler_reg, _e1, 0i, 2.3f);
+    a = (_e96 + _e100);
+    let _e102 = a;
+    let _e106 = textureSampleLevel(image_2d_array, sampler_reg, _e1, 0i, 2.3f, vec2<i32>(3i, 1i));
+    a = (_e102 + _e106);
+    let _e108 = a;
+    let _e113 = textureSampleBias(image_2d_array, sampler_reg, _e1, 0i, 2f, vec2<i32>(3i, 1i));
+    a = (_e108 + _e113);
+    let _e115 = a;
+    let _e118 = textureSampleGrad(image_cube, sampler_reg, _e3, _e3, _e3);
+    a = (_e115 + _e118);
+    let _e120 = a;
+    let _e124 = textureSample(image_cube_array, sampler_reg, _e3, 0u);
+    a = (_e120 + _e124);
+    let _e126 = a;
+    let _e130 = textureSampleLevel(image_cube_array, sampler_reg, _e3, 0u, 2.3f);
+    a = (_e126 + _e130);
+    let _e132 = a;
+    let _e137 = textureSampleBias(image_cube_array, sampler_reg, _e3, 0u, 2f);
+    a = (_e132 + _e137);
+    let _e139 = a;
+    let _e143 = textureSampleGrad(image_cube_array, sampler_reg, _e3, 0u, _e3, _e3);
+    a = (_e139 + _e143);
+    let _e145 = a;
+    let _e149 = textureSample(image_cube_array, sampler_reg, _e3, 0i);
+    a = (_e145 + _e149);
+    let _e151 = a;
+    let _e155 = textureSampleLevel(image_cube_array, sampler_reg, _e3, 0i, 2.3f);
+    a = (_e151 + _e155);
+    let _e157 = a;
+    let _e162 = textureSampleBias(image_cube_array, sampler_reg, _e3, 0i, 2f);
+    a = (_e157 + _e162);
+    let _e164 = a;
+    let _e168 = textureSampleGrad(image_cube_array, sampler_reg, _e3, 0i, _e3, _e3);
+    a = (_e164 + _e168);
+    let _e170 = a;
+    let _e173 = textureSampleGrad(image_3d, sampler_reg, _e3, _e3, _e3);
+    a = (_e170 + _e173);
+    let _e175 = a;
+    return _e175;
 }
 
-@fragment 
+@fragment
 fn texture_sample_comparison() -> @location(0) f32 {
     var a_1: f32;
 
@@ -225,7 +240,7 @@ fn texture_sample_comparison() -> @location(0) f32 {
     return _e50;
 }
 
-@fragment 
+@fragment
 fn gather() -> @location(0) vec4<f32> {
     let tc_1 = vec2(0.5f);
     let s2d = textureGather(1, image_2d, sampler_reg, tc_1);
@@ -238,7 +253,7 @@ fn gather() -> @location(0) vec4<f32> {
     return ((((s2d + s2d_offset) + s2d_depth) + s2d_depth_offset) + f);
 }
 
-@fragment 
+@fragment
 fn depth_no_comparison() -> @location(0) vec4<f32> {
     let tc_2 = vec2(0.5f);
     let s2d_1 = textureSample(image_2d_depth, sampler_reg, tc_2);

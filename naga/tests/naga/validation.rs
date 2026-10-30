@@ -87,7 +87,7 @@ fn populate_atomic_result() {
     // the differences between the test cases.
     fn try_variant(
         variant: Variant,
-    ) -> Result<ModuleInfo, naga::WithSpan<naga::valid::ValidationError>> {
+    ) -> Result<ModuleInfo, Box<naga::WithSpan<naga::valid::ValidationError>>> {
         let span = naga::Span::default();
         let mut module = Module::default();
         let ty_u32 = module.types.insert(
@@ -189,7 +189,7 @@ fn populate_call_result() {
     // the differences between the test cases.
     fn try_variant(
         variant: Variant,
-    ) -> Result<ModuleInfo, naga::WithSpan<naga::valid::ValidationError>> {
+    ) -> Result<ModuleInfo, Box<naga::WithSpan<naga::valid::ValidationError>>> {
         let span = naga::Span::default();
         let mut module = Module::default();
         let ty_u32 = module.types.insert(
@@ -265,7 +265,9 @@ fn emit_workgroup_uniform_load_result() {
     //
     // Looking at uses of the `wg_load` makes it easy to identify the
     // differences between the two variants.
-    fn variant(wg_load: bool) -> Result<ModuleInfo, naga::WithSpan<naga::valid::ValidationError>> {
+    fn variant(
+        wg_load: bool,
+    ) -> Result<ModuleInfo, Box<naga::WithSpan<naga::valid::ValidationError>>> {
         let span = naga::Span::default();
         let mut module = Module::default();
         let ty_u32 = module.types.insert(
@@ -337,7 +339,7 @@ fn builtin_cross_product_args() {
     fn variant(
         size: VectorSize,
         arity: usize,
-    ) -> Result<ModuleInfo, naga::WithSpan<naga::valid::ValidationError>> {
+    ) -> Result<ModuleInfo, Box<naga::WithSpan<naga::valid::ValidationError>>> {
         let span = naga::Span::default();
         let mut module = Module::default();
         let ty_vec3f = module.types.insert(
@@ -410,6 +412,76 @@ fn builtin_cross_product_args() {
     assert!(variant(VectorSize::Tri, 4).is_err());
 
     assert!(variant(VectorSize::Quad, 2).is_err());
+}
+
+#[test]
+fn builtin_sign_unsigned_arg() {
+    use naga::{MathFunction, Type, TypeInner, VectorSize};
+
+    fn variant(scalar: Scalar) -> Result<ModuleInfo, Box<valid::ValidationError>> {
+        let span = naga::Span::default();
+        let mut module = Module::default();
+        let ty_vec4 = module.types.insert(
+            Type {
+                name: None,
+                inner: TypeInner::Vector {
+                    size: VectorSize::Quad,
+                    scalar,
+                },
+            },
+            span,
+        );
+
+        let mut fun = Function {
+            result: Some(naga::ir::FunctionResult {
+                ty: ty_vec4,
+                binding: None,
+            }),
+            ..Function::default()
+        };
+        let ex_zero = fun.expressions.append(Expression::ZeroValue(ty_vec4), span);
+        let ex_sign = fun.expressions.append(
+            Expression::Math {
+                fun: MathFunction::Sign,
+                arg: ex_zero,
+                arg1: None,
+                arg2: None,
+                arg3: None,
+            },
+            span,
+        );
+
+        fun.body.push(
+            naga::Statement::Emit(naga::Range::new_from_bounds(ex_sign, ex_sign)),
+            span,
+        );
+        fun.body.push(
+            naga::Statement::Return {
+                value: Some(ex_sign),
+            },
+            span,
+        );
+
+        module.functions.append(fun, span);
+
+        valid::Validator::new(ValidationFlags::default(), Capabilities::all())
+            .validate(&module)
+            .map_err(|err| Box::new(err.into_inner()))
+    }
+
+    variant(Scalar::I32).expect("module should validate");
+    assert!(matches!(
+        variant(Scalar::U32).map_err(|e| *e),
+        Err(valid::ValidationError::Function {
+            source: valid::FunctionError::Expression {
+                source: valid::ExpressionError::Type(
+                    naga::proc::ResolveError::BuiltinArgumentsInvalid(_)
+                ),
+                ..
+            },
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -534,6 +606,52 @@ fn no_flat_first_in_glsl() {
         err,
         naga::back::glsl::Error::FirstSamplingNotSupported
     ));
+}
+
+#[test]
+fn no_linear_interpolation_in_glsl_es() {
+    use dummy_interpolation_shader::DummyInterpolationShader;
+
+    let DummyInterpolationShader {
+        source: _,
+        module,
+        interpolate_attr,
+        entry_point,
+    } = DummyInterpolationShader::new(naga::Interpolation::Linear, None);
+
+    let mut validator = naga::valid::Validator::new(Default::default(), valid::Capabilities::all());
+    let module_info = validator.validate(&module).unwrap();
+
+    let options = naga::back::glsl::Options {
+        version: naga::back::glsl::Version::Embedded {
+            version: 300,
+            is_webgl: true,
+        },
+        ..Default::default()
+    };
+    let pipeline_options = naga::back::glsl::PipelineOptions {
+        shader_stage: naga::ShaderStage::Fragment,
+        entry_point: entry_point.to_owned(),
+        multiview: None,
+    };
+    let err = naga::back::glsl::Writer::new(
+        String::new(),
+        &module,
+        &module_info,
+        &options,
+        &pipeline_options,
+        Default::default(),
+    )
+    .err()
+    .unwrap_or_else(|| {
+        panic!("`{interpolate_attr}` should fail backend validation on GLSL ES");
+    });
+
+    // The message must name the version and the feature, so that it is actionable.
+    assert_eq!(
+        err.to_string(),
+        "GLSL 300 es doesn't support the required feature(s): NOPERSPECTIVE_QUALIFIER"
+    );
 }
 
 mod dummy_interpolation_shader {
@@ -754,7 +872,7 @@ error: Function [1] 'main' is invalid
 
 #[test]
 fn bad_texture_dimensions_level() {
-    fn validate(level: &str) -> Result<ModuleInfo, naga::valid::ValidationError> {
+    fn validate(level: &str) -> Result<ModuleInfo, Box<naga::valid::ValidationError>> {
         let source = format!(
             r#"
             @group(0) @binding(0)
@@ -767,12 +885,12 @@ fn bad_texture_dimensions_level() {
         let module = naga::front::wgsl::parse_str(&source).expect("module should parse");
         valid::Validator::new(Default::default(), valid::Capabilities::all())
             .validate(&module)
-            .map_err(|err| err.into_inner()) // discard spans
+            .map_err(|err| Box::new(err.into_inner())) // discard spans
     }
 
-    fn is_bad_level_error(result: Result<ModuleInfo, naga::valid::ValidationError>) -> bool {
+    fn is_bad_level_error(result: Result<ModuleInfo, Box<naga::valid::ValidationError>>) -> bool {
         matches!(
-            result,
+            result.map_err(|e| *e),
             Err(naga::valid::ValidationError::Function {
                 handle: _,
                 name: _,
@@ -1203,7 +1321,7 @@ fn arity_check() {
     use naga::Span;
     let _ = env_logger::builder().is_test(true).try_init();
 
-    type Result = core::result::Result<ModuleInfo, naga::valid::ValidationError>;
+    type Result = core::result::Result<ModuleInfo, Box<naga::valid::ValidationError>>;
 
     fn validate(fun: ir::MathFunction, args: &[usize]) -> Result {
         let nowhere = Span::default();
@@ -1244,7 +1362,7 @@ fn arity_check() {
         module.functions.append(f, nowhere);
         valid::Validator::new(Default::default(), valid::Capabilities::all())
             .validate(&module)
-            .map_err(|err| err.into_inner()) // discard spans
+            .map_err(|err| Box::new(err.into_inner())) // discard spans
     }
 
     assert!(validate(Mf::Sin, &[]).is_ok());
@@ -1750,4 +1868,201 @@ fn memory_decorations_require_storage_address_space() {
             ..
         }
     ));
+}
+
+/// Naga validation should permit multiple entry points to have the same name,
+/// as long as they are for distinct stages.
+///
+/// WGSL does not permit conflicting names; this is a case where Naga IR is
+/// looser than WGSL.
+#[test]
+fn entry_points_distinguished_by_stage() {
+    let mut test_spans = TestSpanGenerator::default();
+    let mut module = Module::default();
+
+    let ty_vec4f = module.types.insert(
+        ir::Type {
+            name: Some("vec4f".to_string()),
+            inner: ir::TypeInner::Vector {
+                size: ir::VectorSize::Quad,
+                scalar: ir::Scalar::F32,
+            },
+        },
+        test_spans.next(),
+    );
+
+    let vertex_function = ir::Function {
+        name: Some("non_unique_name".into()),
+        result: Some(ir::FunctionResult {
+            ty: ty_vec4f,
+            binding: Some(ir::Binding::BuiltIn(ir::BuiltIn::Position {
+                invariant: false,
+            })),
+        }),
+        ..ir::Function::default()
+    };
+    module.entry_points.push(ir::EntryPoint {
+        name: "non_unique_name".into(),
+        stage: ir::ShaderStage::Vertex,
+        early_depth_test: None,
+        workgroup_size: [0, 0, 0],
+        workgroup_size_overrides: None,
+        function: vertex_function,
+        mesh_info: None,
+        task_payload: None,
+        incoming_ray_payload: None,
+    });
+
+    module.entry_points.push(ir::EntryPoint {
+        name: "non_unique_name".into(),
+        stage: ir::ShaderStage::Compute,
+        early_depth_test: None,
+        workgroup_size: [1, 1, 1],
+        workgroup_size_overrides: None,
+        function: ir::Function::default(),
+        mesh_info: None,
+        task_payload: None,
+        incoming_ray_payload: None,
+    });
+
+    valid::Validator::new(
+        valid::ValidationFlags::default(),
+        valid::Capabilities::default(),
+    )
+    .validate(&module)
+    .expect("module should be valid");
+}
+
+/// Naga validation should not allow a `Module` to have multiple entry points
+/// with the same name and the same stage.
+#[test]
+fn entry_points_share_name() {
+    let mut module = Module::default();
+
+    module.entry_points.push(ir::EntryPoint {
+        name: "non_unique_name".into(),
+        stage: ir::ShaderStage::Compute,
+        early_depth_test: None,
+        workgroup_size: [1, 1, 1],
+        workgroup_size_overrides: None,
+        function: ir::Function::default(),
+        mesh_info: None,
+        task_payload: None,
+        incoming_ray_payload: None,
+    });
+
+    module.entry_points.push(ir::EntryPoint {
+        name: "non_unique_name".into(),
+        stage: ir::ShaderStage::Compute,
+        early_depth_test: None,
+        workgroup_size: [1, 1, 1],
+        workgroup_size_overrides: None,
+        function: ir::Function::default(),
+        mesh_info: None,
+        task_payload: None,
+        incoming_ray_payload: None,
+    });
+
+    let err = valid::Validator::new(
+        valid::ValidationFlags::default(),
+        valid::Capabilities::default(),
+    )
+    .validate(&module)
+    .expect_err("module should be invalid");
+
+    assert!(matches!(
+        err.into_inner(),
+        valid::ValidationError::EntryPoint {
+            source: valid::EntryPointError::Conflict,
+            ..
+        }
+    ));
+}
+
+/// Naga validation should permit a `Module` to have multiple non-entry-point
+/// functions with the same name.
+///
+/// WGSL does not allow this, but Naga IR does: it always refers to functions by
+/// handle, so the names aren't actually needed to interpret the module's
+/// contents.
+#[test]
+fn functions_share_name() {
+    let mut test_spans = TestSpanGenerator::default();
+    let mut module = Module::default();
+
+    module.functions.append(
+        ir::Function {
+            name: Some("non_unique_name".into()),
+            result: None,
+            ..ir::Function::default()
+        },
+        test_spans.next(),
+    );
+
+    module.functions.append(
+        ir::Function {
+            name: Some("non_unique_name".into()),
+            result: None,
+            ..ir::Function::default()
+        },
+        test_spans.next(),
+    );
+
+    valid::Validator::new(
+        valid::ValidationFlags::default(),
+        valid::Capabilities::default(),
+    )
+    .validate(&module)
+    .expect("module should be valid");
+}
+
+/// Walk `words` instruction by instruction, using each instruction header's word count, and check
+/// that the walk lands exactly on the end of the module.
+#[track_caller]
+fn assert_spv_instruction_lengths_consistent(words: &[u32]) {
+    const HEADER_WORDS: usize = 5;
+
+    let mut offset = HEADER_WORDS;
+    while offset < words.len() {
+        let word_count = (words[offset] >> 16) as usize;
+        assert_ne!(word_count, 0, "instruction at word {offset} has no length");
+        offset += word_count;
+    }
+    assert_eq!(
+        offset,
+        words.len(),
+        "instruction lengths overrun the module"
+    );
+}
+
+/// NOTE: `OpEntryPoint` spends three words on its header, execution model, and function id. The
+/// nul-terminated name must fit in what remains.
+const LONGEST_SPV_ENTRY_POINT_NAME_LEN: usize = (u16::MAX as usize - 3) * 4 - 1;
+
+fn write_spv_with_entry_point_name_len(name_len: usize) -> Vec<u32> {
+    let name = "e".repeat(name_len);
+    let source = format!("@compute @workgroup_size(1) fn {name}() {{}}");
+
+    let module = naga::front::wgsl::parse_str(&source).unwrap();
+    let info = naga::valid::Validator::new(Default::default(), Default::default())
+        .validate(&module)
+        .unwrap();
+
+    naga::back::spv::write_vec(&module, &info, &Default::default(), None).unwrap()
+}
+
+/// Ensure we behave when entry-point name is at its limit.
+#[test]
+fn spv_longest_entry_point_name() {
+    let words = write_spv_with_entry_point_name_len(LONGEST_SPV_ENTRY_POINT_NAME_LEN);
+    assert_spv_instruction_lengths_consistent(&words);
+}
+
+/// Ensure we panic when an entry-point name is too long for `OpEntryPoint`.
+#[test]
+#[should_panic(
+    expected = "EntryPoint instruction is 65536 words long, but SPIR-V instructions are limited to 65535 words"
+)]
+fn spv_entry_point_name_too_long() {
+    write_spv_with_entry_point_name_len(LONGEST_SPV_ENTRY_POINT_NAME_LEN + 1);
 }

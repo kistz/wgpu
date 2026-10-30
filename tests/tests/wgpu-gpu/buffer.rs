@@ -1,5 +1,6 @@
 use wgpu_test::{
-    gpu_test, FailureCase, GpuTestConfiguration, GpuTestInitializer, TestParameters, TestingContext,
+    apply, gpu_test, FailureCase, GpuTestConfiguration, GpuTestInitializer, TestParameters,
+    TestingContext,
 };
 
 pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
@@ -12,6 +13,10 @@ pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
         MINIMUM_BUFFER_BINDING_SIZE_DISPATCH,
         CLEAR_OFFSET_OUTSIDE_RESOURCE_BOUNDS,
         CLEAR_OFFSET_PLUS_SIZE_OUTSIDE_U64_BOUNDS,
+        DEVICE_DESTROY_WHILE_WRITING_MAPPED_BUFFER,
+        DEVICE_DESTROY_WHILE_READING_MAPPED_BUFFER,
+        BUFFER_DESTROY_WHILE_READING_MAPPED_BUFFER,
+        BUFFER_DESTROY_WHILE_WRITING_MAPPED_BUFFER,
     ]);
 }
 
@@ -87,11 +92,6 @@ async fn test_empty_buffer_range_with_usage(
             .unwrap();
 
         {
-            let view = b0.slice(0..0).get_mapped_range().unwrap();
-            assert!(view.is_empty());
-        }
-
-        {
             let view = b0.slice(0..0).get_mapped_range_mut().unwrap();
             assert!(view.is_empty());
         }
@@ -112,11 +112,6 @@ async fn test_empty_buffer_range_with_usage(
         mapped_at_creation: true,
     });
 
-    {
-        let view = b1.slice(0..0).get_mapped_range().unwrap();
-        assert!(view.is_empty());
-    }
-
     if usage.contains(wgpu::BufferUsages::MAP_WRITE) {
         let view = b1.slice(0..0).get_mapped_range_mut().unwrap();
         assert!(view.is_empty());
@@ -129,7 +124,7 @@ async fn test_empty_buffer_range_with_usage(
         .unwrap();
 }
 
-#[gpu_test]
+#[apply(gpu_test!)]
 static EMPTY_BUFFER_READ: GpuTestConfiguration = GpuTestConfiguration::new()
     .parameters(TestParameters::default().enable_noop())
     .run_async(|ctx| async move {
@@ -138,7 +133,7 @@ static EMPTY_BUFFER_READ: GpuTestConfiguration = GpuTestConfiguration::new()
         test_empty_buffer_range_with_usage(&ctx, 0, "zero-sized buffer", usage).await;
     });
 
-#[gpu_test]
+#[apply(gpu_test!)]
 static EMPTY_BUFFER_READ_WRITE: GpuTestConfiguration = GpuTestConfiguration::new()
     .parameters(
         TestParameters::default()
@@ -151,7 +146,7 @@ static EMPTY_BUFFER_READ_WRITE: GpuTestConfiguration = GpuTestConfiguration::new
         test_empty_buffer_range_with_usage(&ctx, 0, "zero-sized buffer", usage).await;
     });
 
-#[gpu_test]
+#[apply(gpu_test!)]
 static MAP_OFFSET: GpuTestConfiguration = GpuTestConfiguration::new()
     .parameters(TestParameters::default().enable_noop())
     .run_async(|ctx| async move {
@@ -228,7 +223,7 @@ static MAP_OFFSET: GpuTestConfiguration = GpuTestConfiguration::new()
 /// intervening submit.
 ///
 /// Regression test for [#5173](https://github.com/gfx-rs/wgpu/issues/5173).
-#[gpu_test]
+#[apply(gpu_test!)]
 static MAP_WITHOUT_SUBMIT: GpuTestConfiguration =
     GpuTestConfiguration::new().run_async(|ctx| async move {
         let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -273,7 +268,7 @@ static MAP_WITHOUT_SUBMIT: GpuTestConfiguration =
 /// This test tries to build a pipeline from a shader module with a
 /// 32-byte variable and a bindgroup layout with a min_binding_size of
 /// 16 for that variable's group/index. Pipeline creation should fail.
-#[gpu_test]
+#[apply(gpu_test!)]
 static MINIMUM_BUFFER_BINDING_SIZE_LAYOUT: GpuTestConfiguration = GpuTestConfiguration::new()
     .parameters(TestParameters::default().test_features_limits().enable_noop())
     .run_sync(|ctx| {
@@ -343,7 +338,7 @@ static MINIMUM_BUFFER_BINDING_SIZE_LAYOUT: GpuTestConfiguration = GpuTestConfigu
 /// variable with a bindgroup layout with a min_binding_size of zero
 /// (meaning, "validate at dispatch recording time") and a 16-byte
 /// binding. Command recording should fail.
-#[gpu_test]
+#[apply(gpu_test!)]
 static MINIMUM_BUFFER_BINDING_SIZE_DISPATCH: GpuTestConfiguration = GpuTestConfiguration::new()
     .parameters(TestParameters::default().test_features_limits().enable_noop())
     .run_sync(|ctx| {
@@ -440,7 +435,7 @@ static MINIMUM_BUFFER_BINDING_SIZE_DISPATCH: GpuTestConfiguration = GpuTestConfi
         );
     });
 
-#[gpu_test]
+#[apply(gpu_test!)]
 static CLEAR_OFFSET_OUTSIDE_RESOURCE_BOUNDS: GpuTestConfiguration = GpuTestConfiguration::new()
     .parameters(TestParameters::default().enable_noop())
     .run_sync(|ctx| {
@@ -465,7 +460,7 @@ static CLEAR_OFFSET_OUTSIDE_RESOURCE_BOUNDS: GpuTestConfiguration = GpuTestConfi
         );
     });
 
-#[gpu_test]
+#[apply(gpu_test!)]
 static CLEAR_OFFSET_PLUS_SIZE_OUTSIDE_U64_BOUNDS: GpuTestConfiguration =
     GpuTestConfiguration::new()
         .parameters(TestParameters::default().enable_noop())
@@ -495,4 +490,244 @@ static CLEAR_OFFSET_PLUS_SIZE_OUTSIDE_U64_BOUNDS: GpuTestConfiguration =
                     "but these added together exceed `u64::MAX`"
                 )),
             );
+        });
+
+#[apply(gpu_test!)]
+static DEVICE_DESTROY_WHILE_WRITING_MAPPED_BUFFER: GpuTestConfiguration =
+    GpuTestConfiguration::new()
+        .parameters(TestParameters::default().enable_noop())
+        .run_sync(|_ctx| {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let ctx = _ctx;
+                let buffer_size: u64 = 64 * 1024 * 1024; // 1MiB
+
+                let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("big buffer"),
+                    size: buffer_size,
+                    usage: wgpu::BufferUsages::MAP_WRITE,
+                    mapped_at_creation: false,
+                });
+
+                buffer
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Write, Result::unwrap);
+
+                ctx.device
+                    .poll(wgpu::PollType::wait_indefinitely())
+                    .unwrap();
+
+                let mut view = buffer.slice(..).get_mapped_range_mut().unwrap();
+
+                use std::sync::atomic::{AtomicBool, Ordering};
+
+                let writing_started = &AtomicBool::new(false);
+                let done = &AtomicBool::new(false);
+                std::thread::scope(|s| {
+                    s.spawn(move || {
+                        while !writing_started.load(Ordering::Acquire) {
+                            std::hint::spin_loop();
+                        }
+
+                        let wgc_device = ctx.device.as_core().unwrap();
+                        wgc_device.destroy();
+
+                        while !done.load(Ordering::Relaxed) {
+                            let _ = ctx.device.poll(wgpu::PollType::Poll);
+                        }
+                    });
+
+                    s.spawn(move || {
+                        let data = vec![0x55u8; buffer_size as usize];
+                        writing_started.store(true, Ordering::Release);
+
+                        for _ in 0..20 {
+                            view.copy_from_slice(&data);
+                            std::thread::yield_now();
+                        }
+
+                        done.store(true, Ordering::Relaxed);
+                    });
+                });
+            }
+        });
+
+#[apply(gpu_test!)]
+static DEVICE_DESTROY_WHILE_READING_MAPPED_BUFFER: GpuTestConfiguration =
+    GpuTestConfiguration::new()
+        .parameters(TestParameters::default().enable_noop())
+        .run_sync(|_ctx| {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let ctx = _ctx;
+                let buffer_size: u64 = 64 * 1024 * 1024; // 1MiB
+
+                let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("big buffer"),
+                    size: buffer_size,
+                    usage: wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+
+                buffer
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, Result::unwrap);
+
+                ctx.device
+                    .poll(wgpu::PollType::wait_indefinitely())
+                    .unwrap();
+
+                let view = buffer.slice(..).get_mapped_range().unwrap();
+
+                use std::sync::atomic::{AtomicBool, Ordering};
+
+                let writing_started = &AtomicBool::new(false);
+                let done = &AtomicBool::new(false);
+                std::thread::scope(|s| {
+                    s.spawn(move || {
+                        while !writing_started.load(Ordering::Acquire) {
+                            std::hint::spin_loop();
+                        }
+
+                        let wgc_device = ctx.device.as_core().unwrap();
+                        wgc_device.destroy();
+
+                        while !done.load(Ordering::Relaxed) {
+                            let _ = ctx.device.poll(wgpu::PollType::Poll);
+                        }
+                    });
+
+                    s.spawn(move || {
+                        let mut data = vec![0u8; buffer_size as usize];
+                        writing_started.store(true, Ordering::Release);
+
+                        for _ in 0..20 {
+                            data.copy_from_slice(&view);
+                            std::thread::yield_now();
+                        }
+
+                        done.store(true, Ordering::Relaxed);
+                    });
+                });
+            }
+        });
+
+#[apply(gpu_test!)]
+static BUFFER_DESTROY_WHILE_WRITING_MAPPED_BUFFER: GpuTestConfiguration =
+    GpuTestConfiguration::new()
+        .parameters(TestParameters::default().enable_noop())
+        .run_sync(|_ctx| {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let ctx = _ctx;
+                let buffer_size: u64 = 64 * 1024 * 1024; // 1MiB
+
+                let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("big buffer"),
+                    size: buffer_size,
+                    usage: wgpu::BufferUsages::MAP_WRITE,
+                    mapped_at_creation: false,
+                });
+
+                buffer
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Write, Result::unwrap);
+
+                ctx.device
+                    .poll(wgpu::PollType::wait_indefinitely())
+                    .unwrap();
+
+                let mut view = buffer.slice(..).get_mapped_range_mut().unwrap();
+
+                use std::sync::atomic::{AtomicBool, Ordering};
+
+                let writing_started = &AtomicBool::new(false);
+                let done = &AtomicBool::new(false);
+                std::thread::scope(|s| {
+                    s.spawn(move || {
+                        while !writing_started.load(Ordering::Acquire) {
+                            std::hint::spin_loop();
+                        }
+
+                        let wgc_buffer = unsafe { buffer.as_core() }.unwrap();
+                        wgc_buffer.destroy(); // should call wgc's destroy
+
+                        while !done.load(Ordering::Relaxed) {
+                            let _ = ctx.device.poll(wgpu::PollType::Poll);
+                        }
+                    });
+
+                    s.spawn(move || {
+                        let data = vec![0x55u8; buffer_size as usize];
+                        writing_started.store(true, Ordering::Release);
+
+                        for _ in 0..20 {
+                            view.copy_from_slice(&data);
+                            std::thread::yield_now();
+                        }
+
+                        done.store(true, Ordering::Relaxed);
+                    });
+                });
+            }
+        });
+
+#[apply(gpu_test!)]
+static BUFFER_DESTROY_WHILE_READING_MAPPED_BUFFER: GpuTestConfiguration =
+    GpuTestConfiguration::new()
+        .parameters(TestParameters::default().enable_noop())
+        .run_sync(|_ctx| {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let ctx = _ctx;
+                let buffer_size: u64 = 64 * 1024 * 1024; // 1MiB
+
+                let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("big buffer"),
+                    size: buffer_size,
+                    usage: wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+
+                buffer
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, Result::unwrap);
+
+                ctx.device
+                    .poll(wgpu::PollType::wait_indefinitely())
+                    .unwrap();
+
+                let view = buffer.slice(..).get_mapped_range().unwrap();
+
+                use std::sync::atomic::{AtomicBool, Ordering};
+
+                let writing_started = &AtomicBool::new(false);
+                let done = &AtomicBool::new(false);
+                std::thread::scope(|s| {
+                    s.spawn(move || {
+                        while !writing_started.load(Ordering::Acquire) {
+                            std::hint::spin_loop();
+                        }
+
+                        let wgc_buffer = unsafe { buffer.as_core() }.unwrap();
+                        wgc_buffer.destroy();
+
+                        while !done.load(Ordering::Relaxed) {
+                            let _ = ctx.device.poll(wgpu::PollType::Poll);
+                        }
+                    });
+
+                    s.spawn(move || {
+                        let mut data = vec![0u8; buffer_size as usize];
+                        writing_started.store(true, Ordering::Release);
+
+                        for _ in 0..20 {
+                            data.copy_from_slice(&view);
+                            std::thread::yield_now();
+                        }
+
+                        done.store(true, Ordering::Relaxed);
+                    });
+                });
+            }
         });

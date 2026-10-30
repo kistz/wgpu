@@ -1,7 +1,7 @@
 use wgpu::{DownlevelFlags, Limits};
 
 use crate::shader::{shader_input_output_test, InputStorageType, ShaderTest};
-use wgpu_test::{gpu_test, GpuTestConfiguration, GpuTestInitializer, TestParameters};
+use wgpu_test::{apply, gpu_test, GpuTestConfiguration, GpuTestInitializer, TestParameters};
 
 pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
     vec.extend([UNPACK4xU8, UNPACK4xI8, PACK4xU8, PACK4xI8]);
@@ -33,7 +33,7 @@ fn create_unpack4xU8_test() -> Vec<ShaderTest> {
     tests
 }
 
-#[gpu_test]
+#[apply(gpu_test!)]
 static UNPACK4xU8: GpuTestConfiguration = GpuTestConfiguration::new()
     .parameters(
         TestParameters::default()
@@ -77,7 +77,7 @@ fn create_unpack4xI8_test() -> Vec<ShaderTest> {
     tests
 }
 
-#[gpu_test]
+#[apply(gpu_test!)]
 static UNPACK4xI8: GpuTestConfiguration = GpuTestConfiguration::new()
     .parameters(
         TestParameters::default()
@@ -106,7 +106,7 @@ fn create_pack4xU8_test() -> Vec<ShaderTest> {
     tests
 }
 
-#[gpu_test]
+#[apply(gpu_test!)]
 static PACK4xU8: GpuTestConfiguration = GpuTestConfiguration::new()
     .parameters(
         TestParameters::default()
@@ -128,10 +128,7 @@ fn create_pack4xI8_test() -> Vec<ShaderTest> {
         ([-0xBB - 1, -0xCC - 1, -0xDD - 1, -0xEE - 1], 0x11223344),
     ];
     // Assure that test data of the first two cases end in equal bit values
-    for value in values.map(|value| value.0)[..2].chunks_exact(2) {
-        let [first, second] = value else {
-            panic!("Expected at least 2 test values")
-        };
+    for [first, second] in values.map(|value| value.0)[..2].as_chunks::<2>().0 {
         for (first, second) in first.iter().zip(second.iter()) {
             assert_eq!(
                 first & 0xFF,
@@ -154,7 +151,7 @@ fn create_pack4xI8_test() -> Vec<ShaderTest> {
     tests
 }
 
-#[gpu_test]
+#[apply(gpu_test!)]
 static PACK4xI8: GpuTestConfiguration = GpuTestConfiguration::new()
     .parameters(
         TestParameters::default()

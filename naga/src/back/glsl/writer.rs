@@ -930,6 +930,22 @@ impl<'a, W: Write> Writer<'a, W> {
                     _ => {}
                 }
             }
+
+            if let Expression::Binary {
+                op: crate::BinaryOperator::Modulo,
+                left,
+                right,
+            } = *expr
+            {
+                // Integer `%` is lowered to `left - right * (left / right)` in
+                // write_expr (`BinaryOperation::ModuloInt`), which references each
+                // operand twice, so bake both to avoid re-evaluating them.
+                if let Some(crate::ScalarKind::Sint | crate::ScalarKind::Uint) = inner.scalar_kind()
+                {
+                    self.need_bake_expressions.insert(left);
+                    self.need_bake_expressions.insert(right);
+                }
+            }
         }
 
         for statement in func.body.iter() {
@@ -994,11 +1010,7 @@ impl<'a, W: Write> Writer<'a, W> {
                 "_immediates_binding_{}",
                 shader_stage_to_str(self.entry_point.stage)
             )?,
-            (&None, _) => write!(
-                self.out,
-                "{}",
-                &self.names[&NameKey::GlobalVariable(handle)]
-            )?,
+            (&None, _) => write!(self.out, "{}", self.names[&NameKey::GlobalVariable(handle)])?,
         }
 
         Ok(())
@@ -1302,7 +1314,7 @@ impl<'a, W: Write> Writer<'a, W> {
 
             // Write the argument name
             // The leading space is important
-            write!(this.out, " {}", &this.names[&ctx.argument_key(i as u32)])?;
+            write!(this.out, " {}", this.names[&ctx.argument_key(i as u32)])?;
 
             // Write array size
             match this.module.types[arg.ty].inner {
@@ -1558,7 +1570,7 @@ impl<'a, W: Write> Writer<'a, W> {
                     write!(
                         self.out,
                         " {}",
-                        &self.names[&NameKey::StructMember(handle, idx as u32)]
+                        self.names[&NameKey::StructMember(handle, idx as u32)]
                     )?;
                     // Write [size]
                     self.write_array_size(base, size)?;
@@ -1576,7 +1588,7 @@ impl<'a, W: Write> Writer<'a, W> {
                     writeln!(
                         self.out,
                         " {};",
-                        &self.names[&NameKey::StructMember(handle, idx as u32)]
+                        self.names[&NameKey::StructMember(handle, idx as u32)]
                     )?;
                 }
             }
@@ -1889,9 +1901,8 @@ impl<'a, W: Write> Writer<'a, W> {
                                             let return_struct = "_tmp_return";
                                             write!(
                                                 self.out,
-                                                "{} {} = ",
-                                                &self.names[&NameKey::Type(result.ty)],
-                                                return_struct
+                                                "{ty} {return_struct} = ",
+                                                ty = self.names[&NameKey::Type(result.ty)],
                                             )?;
                                             self.write_expr(value, ctx)?;
                                             writeln!(self.out, ";")?;
@@ -1929,7 +1940,7 @@ impl<'a, W: Write> Writer<'a, W> {
                                         writeln!(
                                             self.out,
                                             ".{};",
-                                            &self.names
+                                            self.names
                                                 [&NameKey::StructMember(result.ty, index as u32)]
                                         )?;
                                         write!(self.out, "{level}")?;
@@ -2052,7 +2063,7 @@ impl<'a, W: Write> Writer<'a, W> {
                     write!(self.out, " = ")?;
                     self.named_expressions.insert(expr, name);
                 }
-                write!(self.out, "{}(", &self.names[&NameKey::Function(function)])?;
+                write!(self.out, "{}(", self.names[&NameKey::Function(function)])?;
                 let arguments: Vec<_> = arguments
                     .iter()
                     .enumerate()
@@ -2112,7 +2123,10 @@ impl<'a, W: Write> Writer<'a, W> {
                         write!(self.out, ", ")?;
                         if let crate::AtomicFunction::Subtract = *fun {
                             // Emulate `atomicSub` with `atomicAdd` by negating the value.
-                            write!(self.out, "-")?;
+                            //
+                            // Use a space to avoid accidentally producing a prefix increment
+                            // (`--`).
+                            write!(self.out, "- ")?;
                         }
                         self.write_expr(value, ctx)?;
                         writeln!(self.out, ");")?;
@@ -2268,6 +2282,7 @@ impl<'a, W: Write> Writer<'a, W> {
             }
             Statement::CooperativeStore { .. } => unimplemented!(),
             Statement::RayPipelineFunction(_) => unimplemented!(),
+            Statement::DebugPrintf { .. } => unimplemented!(),
         }
 
         Ok(())
@@ -2472,7 +2487,7 @@ impl<'a, W: Write> Writer<'a, W> {
                         write!(
                             self.out,
                             ".{}",
-                            &self.names[&NameKey::StructMember(ty, index)]
+                            self.names[&NameKey::StructMember(ty, index)]
                         )?
                     }
                     ref other => return Err(Error::Custom(format!("Cannot index {other:?}"))),
@@ -2492,7 +2507,7 @@ impl<'a, W: Write> Writer<'a, W> {
             }
             // Function arguments are written as the argument name
             Expression::FunctionArgument(pos) => {
-                write!(self.out, "{}", &self.names[&ctx.argument_key(pos)])?
+                write!(self.out, "{}", self.names[&ctx.argument_key(pos)])?
             }
             // Global variables need some special work for their name but
             // `get_global_name` does the work for us
@@ -2878,6 +2893,9 @@ impl<'a, W: Write> Writer<'a, W> {
                         | Bo::Equal
                         | Bo::NotEqual => BinaryOperation::VectorCompare,
                         Bo::Modulo if scalar.kind == Sk::Float => BinaryOperation::Modulo,
+                        Bo::Modulo if scalar.kind == Sk::Sint || scalar.kind == Sk::Uint => {
+                            BinaryOperation::ModuloInt
+                        }
                         Bo::And if scalar.kind == Sk::Bool => {
                             op = crate::BinaryOperator::LogicalAnd;
                             BinaryOperation::VectorComponentWise
@@ -2893,6 +2911,11 @@ impl<'a, W: Write> Writer<'a, W> {
                             Bo::Modulo => BinaryOperation::Modulo,
                             _ => BinaryOperation::Other,
                         },
+                        (Some(Sk::Sint | Sk::Uint), _) | (_, Some(Sk::Sint | Sk::Uint))
+                            if op == Bo::Modulo =>
+                        {
+                            BinaryOperation::ModuloInt
+                        }
                         (Some(Sk::Bool), Some(Sk::Bool)) => match op {
                             Bo::InclusiveOr => {
                                 op = crate::BinaryOperator::LogicalOr;
@@ -2950,18 +2973,11 @@ impl<'a, W: Write> Writer<'a, W> {
 
                         write!(self.out, ")")?;
                     }
-                    // TODO: handle undefined behavior of BinaryOperator::Modulo
-                    //
-                    // sint:
-                    // if right == 0 return 0
-                    // if left == min(type_of(left)) && right == -1 return 0
-                    // if sign(left) == -1 || sign(right) == -1 return result as defined by WGSL
-                    //
-                    // uint:
-                    // if right == 0 return 0
-                    //
-                    // float:
-                    // if right == 0 return ? see https://github.com/gpuweb/gpuweb/issues/2798
+                    // Signed/unsigned integer `%` with a negative operand is handled by
+                    // `BinaryOperation::ModuloInt` below. Remaining TODO: the degenerate
+                    // div-by-zero / `INT_MIN % -1` cases (this backend also leaves integer
+                    // `/` unguarded), and float `% 0` (see
+                    // https://github.com/gpuweb/gpuweb/issues/2798).
                     BinaryOperation::Modulo => {
                         write!(self.out, "(")?;
 
@@ -2977,6 +2993,23 @@ impl<'a, W: Write> Writer<'a, W> {
                         write!(self.out, ")")?;
 
                         write!(self.out, ")")?;
+                    }
+                    BinaryOperation::ModuloInt => {
+                        // GLSL's `%` is undefined when either operand is negative.
+                        // Integer division truncates toward zero (which is well
+                        // defined), so reconstruct the remainder as `e1 - e2 * (e1 / e2)`.
+                        // This matches WGSL's truncated `%` for all operands; the
+                        // degenerate `x % 0` / `INT_MIN % -1` cases stay consistent
+                        // with this backend's unguarded integer `/`.
+                        write!(self.out, "(")?;
+                        self.write_expr(left, ctx)?;
+                        write!(self.out, " - ")?;
+                        self.write_expr(right, ctx)?;
+                        write!(self.out, " * (")?;
+                        self.write_expr(left, ctx)?;
+                        write!(self.out, " / ")?;
+                        self.write_expr(right, ctx)?;
+                        write!(self.out, "))")?;
                     }
                     BinaryOperation::Other => {
                         write!(self.out, "(")?;

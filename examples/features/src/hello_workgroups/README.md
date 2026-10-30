@@ -31,10 +31,11 @@ cargo run --bin wgpu-examples hello_workgroups
 ### Introduction
 
 When you call `ComputePass::dispatch_workgroups`, the function dispatches multiple workgroups in a 3d grid defined by the `x`, `y`, and `z` parameters you pass to the function. For example, `dispatch_workgroups(5, 2, 1)` would create a dispatch grid like
-||||||
-|---|---|---|---|---|
-| W | W | W | W | W |
-| W | W | W | W | W |
+
+|     |     |     |     |     |
+| --- | --- | --- | --- | --- |
+| W   | W   | W   | W   | W   |
+| W   | W   | W   | W   | W   |
 
 Where each W is a workgroup. If you want your shader to consider what workgroup within the dispatch the current invocation is in, add a function argument with type `vec3<u32>` and with the attribute `@builtin(workgroup_id)`.
 
@@ -63,7 +64,7 @@ As mentioned above, invocations exist both within the context of a workgroup gri
 
 ## Barriers and Workgroups
 
-Arguably, workgroups are at their most useful when being used alongside barriers. Since barriers are already explained more thoroughly in the hello-synchronization example, this section will be short. Despite affecting different memory address spaces, all synchronization functions affect invocations on a workgroup level, synchronizing the workgroup. See [hello-synchronization/README.md](../hello-synchronization/README.md) for more.
+Arguably, workgroups are at their most useful when being used alongside barriers. Since barriers are already explained more thoroughly in the hello-synchronization example, this section will be short. Despite affecting different memory address spaces, all synchronization functions affect invocations on a workgroup level, synchronizing the workgroup. See [hello-synchronization/README.md](../hello_synchronization/README.md) for more.
 
 ## Links to Technical Resources
 

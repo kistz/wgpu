@@ -14,21 +14,18 @@ use crate::{
         clear_texture, encoder::EncodingState, ArcCommand, CommandEncoderError, EncoderStateError,
     },
     device::MissingDownlevelFlags,
-    global::Global,
-    id::{BufferId, CommandEncoderId, TextureId},
     init_tracker::{
         has_copy_partial_init_tracker_coverage, MemoryInitKind, TextureInitRange,
         TextureInitTrackerAction,
     },
     resource::{
-        Buffer, MissingBufferUsageError, MissingTextureUsageError, ParentDevice, RawResourceAccess,
-        Texture, TextureErrorDimension,
+        Buffer, Labeled, MissingBufferUsageError, MissingTextureUsageError, ParentDevice,
+        RawResourceAccess, Texture, TextureErrorDimension,
     },
 };
 
 use super::ClearError;
 
-type TexelCopyBufferInfo = wgt::TexelCopyBufferInfo<BufferId>;
 type TexelCopyTextureInfo = wgt::TexelCopyTextureInfo<Arc<Texture>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,8 +117,8 @@ pub enum TransferError {
     UnalignedCopyOriginX,
     #[error("Copy origin's y component is not a multiple of block height")]
     UnalignedCopyOriginY,
-    #[error("Bytes per row does not respect `COPY_BYTES_PER_ROW_ALIGNMENT`")]
-    UnalignedBytesPerRow,
+    #[error("Bytes per row ({bytes_per_row}) is not a multiple of {alignment}")]
+    UnalignedBytesPerRow { bytes_per_row: u32, alignment: u32 },
     #[error("Number of bytes per row needs to be specified since more than one row is copied")]
     UnspecifiedBytesPerRow,
     #[error("Number of rows per image needs to be specified since more than one image is copied")]
@@ -205,7 +202,7 @@ impl WebGpuError for TransferError {
             | Self::UnalignedCopyHeight
             | Self::UnalignedCopyOriginX
             | Self::UnalignedCopyOriginY
-            | Self::UnalignedBytesPerRow
+            | Self::UnalignedBytesPerRow { .. }
             | Self::UnspecifiedBytesPerRow
             | Self::UnspecifiedRowsPerImage
             | Self::InvalidBytesPerRow
@@ -431,7 +428,8 @@ pub(crate) fn validate_texture_copy_dst_format(
 ///
 /// And implements the following check from WebGPU's [validating GPUTexelCopyBufferInfo][vtcbi]
 /// algorithm:
-///  * If `aligned` is true, `bytesPerRow` must be a multiple of 256.
+///  * If `aligned` is true, `bytesPerRow` must be a multiple of 256, or only of the texel
+///    block copy size with [`wgt::Features::UNRESTRICTED_BYTES_PER_ROW`].
 ///
 /// Note that the `bytesPerRow` alignment check is enforced whenever
 /// `bytesPerRow` is specified, even if the transfer is not multiple rows and
@@ -454,6 +452,7 @@ pub(crate) fn validate_texture_buffer_copy<T>(
     desc: &wgt::TextureDescriptor<String, Vec<wgt::TextureFormat>>,
     layout: &wgt::TexelCopyBufferLayout,
     aligned: bool,
+    features: wgt::Features,
 ) -> Result<(), TransferError> {
     if desc.sample_count != 1 {
         return Err(TransferError::InvalidSampleCount {
@@ -465,16 +464,15 @@ pub(crate) fn validate_texture_buffer_copy<T>(
         return Err(TransferError::CopyAspectNotOne);
     }
 
-    let offset_alignment = if desc.format.is_depth_stencil_format() {
-        4
-    } else {
-        // The case where `block_copy_size` returns `None` is currently
-        // unreachable both for the reason in the expect message, and also
-        // because the currently-defined non-copyable formats are depth/stencil
-        // formats so would take the `if` branch.
+    let block_copy_size = || {
         desc.format
             .block_copy_size(Some(texture_copy_view.aspect))
             .expect("non-copyable formats should have been rejected previously")
+    };
+    let offset_alignment = if desc.format.is_depth_stencil_format() {
+        4
+    } else {
+        block_copy_size()
     };
 
     if aligned && !layout.offset.is_multiple_of(u64::from(offset_alignment)) {
@@ -482,8 +480,16 @@ pub(crate) fn validate_texture_buffer_copy<T>(
     }
 
     if let Some(bytes_per_row) = layout.bytes_per_row {
-        if aligned && bytes_per_row % wgt::COPY_BYTES_PER_ROW_ALIGNMENT != 0 {
-            return Err(TransferError::UnalignedBytesPerRow);
+        let alignment = if features.contains(wgt::Features::UNRESTRICTED_BYTES_PER_ROW) {
+            block_copy_size()
+        } else {
+            wgt::COPY_BYTES_PER_ROW_ALIGNMENT
+        };
+        if aligned && !bytes_per_row.is_multiple_of(alignment) {
+            return Err(TransferError::UnalignedBytesPerRow {
+                bytes_per_row,
+                alignment,
+            });
         }
     }
 
@@ -669,20 +675,37 @@ fn handle_texture_init(
         kind: init_kind,
     };
 
-    // Register the init action.
+    // Record the initialization action. Simultaneously, collect a list of any ranges of the
+    // texture that were discarded within the current command buffer, for immediate
+    // initialization. (The analogous case for passes is in `fixup_discarded_surfaces`.)
+    //
+    // Depth slices are only relevant to deciding which pending discards (in a command
+    // buffer with prior render passes) have to be repaired ahead of this copy. Any
+    // initialization that gets generated covers the whole mip level, because that is the
+    // granularity of the init tracker.
+    let accessed_depth_slices = (texture.desc.dimension == wgt::TextureDimension::D3)
+        .then(|| copy_texture.origin.z..copy_texture.origin.z + copy_size.depth_or_array_layers);
     let immediate_inits = state
         .texture_memory_actions
-        .register_init_action(&{ init_action });
+        .register_init_action(&{ init_action }, accessed_depth_slices);
 
     // In rare cases we may need to insert an init operation immediately onto the command buffer.
     if !immediate_inits.is_empty() {
         for init in immediate_inits {
+            let index = init.layer_or_depth_slice;
+            let (layer_range, depth_slice) = if texture.desc.dimension == wgt::TextureDimension::D3
+            {
+                (0..1, Some(index))
+            } else {
+                (index..(index + 1), None)
+            };
             clear_texture(
                 &init.texture,
                 TextureInitRange {
                     mip_range: init.mip_level..(init.mip_level + 1),
-                    layer_range: init.layer..(init.layer + 1),
+                    layer_range,
                 },
+                depth_slice,
                 state.raw_encoder,
                 &mut state.tracker.textures,
                 &state.device.alignments,
@@ -825,61 +848,83 @@ fn handle_buffer_init(
     }
 }
 
-impl Global {
-    pub fn command_encoder_copy_buffer_to_buffer(
-        &self,
-        command_encoder_id: CommandEncoderId,
-        source: BufferId,
+impl super::CommandEncoder {
+    fn copy_buffer_to_buffer_inner(
+        self: &Arc<Self>,
+        source: Arc<Buffer>,
         source_offset: BufferAddress,
-        destination: BufferId,
+        destination: Arc<Buffer>,
         destination_offset: BufferAddress,
         size: Option<BufferAddress>,
     ) -> Result<(), EncoderStateError> {
         profiling::scope!("CommandEncoder::copy_buffer_to_buffer");
         api_log!(
-            "CommandEncoder::copy_buffer_to_buffer {source:?} -> {destination:?} {size:?}bytes"
+            "CommandEncoder::copy_buffer_to_buffer {:?} -> {:?} {size:?}bytes",
+            Arc::as_ptr(&source),
+            Arc::as_ptr(&destination)
         );
 
-        let hub = &self.hub;
-
-        let cmd_enc = hub.command_encoders.get(command_encoder_id);
-        let mut cmd_buf_data = cmd_enc.data.lock();
+        let mut cmd_buf_data = self.data.lock();
 
         cmd_buf_data.push_with(|| -> Result<_, CommandEncoderError> {
+            source.check_is_valid()?;
+            destination.check_is_valid()?;
             Ok(ArcCommand::CopyBufferToBuffer {
-                src: self.resolve_buffer_id(source)?,
+                src: source,
                 src_offset: source_offset,
-                dst: self.resolve_buffer_id(destination)?,
+                dst: destination,
                 dst_offset: destination_offset,
                 size,
             })
         })
     }
 
-    pub fn command_encoder_copy_buffer_to_texture(
-        &self,
-        command_encoder_id: CommandEncoderId,
-        source: &TexelCopyBufferInfo,
-        destination: &wgt::TexelCopyTextureInfo<TextureId>,
+    pub fn copy_buffer_to_buffer(
+        self: &Arc<Self>,
+        source: Arc<Buffer>,
+        source_offset: BufferAddress,
+        destination: Arc<Buffer>,
+        destination_offset: BufferAddress,
+        size: Option<BufferAddress>,
+    ) {
+        if let Err(err) = self.copy_buffer_to_buffer_inner(
+            source,
+            source_offset,
+            destination,
+            destination_offset,
+            size,
+        ) {
+            self.device.handle_error(
+                err,
+                Some(self.label()),
+                "CommandEncoder::copy_buffer_to_buffer",
+            );
+        }
+    }
+
+    fn copy_buffer_to_texture_inner(
+        self: &Arc<Self>,
+        source: &wgt::TexelCopyBufferInfo<Arc<Buffer>>,
+        destination: &wgt::TexelCopyTextureInfo<Arc<Texture>>,
         copy_size: &Extent3d,
     ) -> Result<(), EncoderStateError> {
         profiling::scope!("CommandEncoder::copy_buffer_to_texture");
         api_log!(
             "CommandEncoder::copy_buffer_to_texture {:?} -> {:?} {copy_size:?}",
-            source.buffer,
-            destination.texture
+            Arc::as_ptr(&source.buffer),
+            Arc::as_ptr(&destination.texture)
         );
 
-        let cmd_enc = self.hub.command_encoders.get(command_encoder_id);
-
-        let mut cmd_buf_data = cmd_enc.data.lock();
+        let mut cmd_buf_data = self.data.lock();
 
         cmd_buf_data.push_with(|| -> Result<_, CommandEncoderError> {
-            let texture = self.resolve_texture_id(destination.texture);
+            let texture = destination.texture.clone();
             texture.check_valid()?;
+            let source_buffer = source.buffer.clone();
+            source_buffer.check_is_valid()?;
             Ok(ArcCommand::CopyBufferToTexture {
                 src: wgt::TexelCopyBufferInfo::<Arc<Buffer>> {
-                    buffer: self.resolve_buffer_id(source.buffer)?,
+                    buffer: source_buffer,
                     layout: source.layout,
                 },
                 dst: wgt::TexelCopyTextureInfo::<Arc<Texture>> {
@@ -893,27 +938,41 @@ impl Global {
         })
     }
 
-    pub fn command_encoder_copy_texture_to_buffer(
-        &self,
-        command_encoder_id: CommandEncoderId,
-        source: &wgt::TexelCopyTextureInfo<TextureId>,
-        destination: &TexelCopyBufferInfo,
+    pub fn copy_buffer_to_texture(
+        self: &Arc<Self>,
+        source: &wgt::TexelCopyBufferInfo<Arc<Buffer>>,
+        destination: &wgt::TexelCopyTextureInfo<Arc<Texture>>,
+        copy_size: &Extent3d,
+    ) {
+        if let Err(err) = self.copy_buffer_to_texture_inner(source, destination, copy_size) {
+            self.device.handle_error(
+                err,
+                Some(self.label()),
+                "CommandEncoder::copy_buffer_to_texture",
+            );
+        }
+    }
+
+    fn copy_texture_to_buffer_inner(
+        self: &Arc<Self>,
+        source: &wgt::TexelCopyTextureInfo<Arc<Texture>>,
+        destination: &wgt::TexelCopyBufferInfo<Arc<Buffer>>,
         copy_size: &Extent3d,
     ) -> Result<(), EncoderStateError> {
         profiling::scope!("CommandEncoder::copy_texture_to_buffer");
         api_log!(
             "CommandEncoder::copy_texture_to_buffer {:?} -> {:?} {copy_size:?}",
-            source.texture,
-            destination.buffer
+            Arc::as_ptr(&source.texture),
+            Arc::as_ptr(&destination.buffer)
         );
 
-        let cmd_enc = self.hub.command_encoders.get(command_encoder_id);
-
-        let mut cmd_buf_data = cmd_enc.data.lock();
+        let mut cmd_buf_data = self.data.lock();
 
         cmd_buf_data.push_with(|| -> Result<_, CommandEncoderError> {
-            let texture = self.resolve_texture_id(source.texture);
+            let texture = source.texture.clone();
             texture.check_valid()?;
+            let destination_buffer = destination.buffer.clone();
+            destination_buffer.check_is_valid()?;
             Ok(ArcCommand::CopyTextureToBuffer {
                 src: wgt::TexelCopyTextureInfo::<Arc<Texture>> {
                     texture,
@@ -922,7 +981,7 @@ impl Global {
                     aspect: source.aspect,
                 },
                 dst: wgt::TexelCopyBufferInfo::<Arc<Buffer>> {
-                    buffer: self.resolve_buffer_id(destination.buffer)?,
+                    buffer: destination_buffer,
                     layout: destination.layout,
                 },
                 size: *copy_size,
@@ -930,27 +989,39 @@ impl Global {
         })
     }
 
-    pub fn command_encoder_copy_texture_to_texture(
-        &self,
-        command_encoder_id: CommandEncoderId,
-        source: &wgt::TexelCopyTextureInfo<TextureId>,
-        destination: &wgt::TexelCopyTextureInfo<TextureId>,
+    pub fn copy_texture_to_buffer(
+        self: &Arc<Self>,
+        source: &wgt::TexelCopyTextureInfo<Arc<Texture>>,
+        destination: &wgt::TexelCopyBufferInfo<Arc<Buffer>>,
+        copy_size: &Extent3d,
+    ) {
+        if let Err(err) = self.copy_texture_to_buffer_inner(source, destination, copy_size) {
+            self.device.handle_error(
+                err,
+                Some(self.label()),
+                "CommandEncoder::copy_texture_to_buffer",
+            );
+        }
+    }
+
+    fn copy_texture_to_texture_inner(
+        self: &Arc<Self>,
+        source: &wgt::TexelCopyTextureInfo<Arc<Texture>>,
+        destination: &wgt::TexelCopyTextureInfo<Arc<Texture>>,
         copy_size: &Extent3d,
     ) -> Result<(), EncoderStateError> {
         profiling::scope!("CommandEncoder::copy_texture_to_texture");
         api_log!(
             "CommandEncoder::copy_texture_to_texture {:?} -> {:?} {copy_size:?}",
-            source.texture,
-            destination.texture
+            Arc::as_ptr(&source.texture),
+            Arc::as_ptr(&destination.texture)
         );
 
-        let cmd_enc = self.hub.command_encoders.get(command_encoder_id);
-
-        let mut cmd_buf_data = cmd_enc.data.lock();
+        let mut cmd_buf_data = self.data.lock();
 
         cmd_buf_data.push_with(|| -> Result<_, CommandEncoderError> {
-            let src_texture = self.resolve_texture_id(source.texture);
-            let dst_texture = self.resolve_texture_id(destination.texture);
+            let src_texture = source.texture.clone();
+            let dst_texture = destination.texture.clone();
             src_texture.check_valid()?;
             dst_texture.check_valid()?;
             Ok(ArcCommand::CopyTextureToTexture {
@@ -969,6 +1040,21 @@ impl Global {
                 size: *copy_size,
             })
         })
+    }
+
+    pub fn copy_texture_to_texture(
+        self: &Arc<Self>,
+        source: &wgt::TexelCopyTextureInfo<Arc<Texture>>,
+        destination: &wgt::TexelCopyTextureInfo<Arc<Texture>>,
+        copy_size: &Extent3d,
+    ) {
+        if let Err(err) = self.copy_texture_to_texture_inner(source, destination, copy_size) {
+            self.device.handle_error(
+                err,
+                Some(self.label()),
+                "CommandEncoder::copy_texture_to_texture",
+            );
+        }
     }
 }
 
@@ -1169,6 +1255,7 @@ pub(super) fn copy_buffer_to_texture(
         &dst_texture.desc,
         &source.layout,
         true, // alignment required for buffer offset
+        state.device.features,
     )?;
 
     let (required_buffer_bytes_in_copy, bytes_per_array_layer, is_contiguous) =
@@ -1286,6 +1373,7 @@ pub(super) fn copy_texture_to_buffer(
         &src_texture.desc,
         &destination.layout,
         true, // alignment required for buffer offset
+        state.device.features,
     )?;
 
     let (required_buffer_bytes_in_copy, bytes_per_array_layer, is_contiguous) =

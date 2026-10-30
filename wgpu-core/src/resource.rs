@@ -1,4 +1,10 @@
-use alloc::{borrow::Cow, borrow::ToOwned as _, boxed::Box, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    borrow::{Cow, ToOwned as _},
+    boxed::Box,
+    string::String,
+    sync::Arc,
+    vec::Vec,
+};
 use core::{
     borrow::Borrow,
     fmt,
@@ -11,7 +17,8 @@ use smallvec::SmallVec;
 use thiserror::Error;
 use wgt::{
     error::{ErrorType, WebGpuError},
-    TextureSelector,
+    math::align_to,
+    MapMode, TextureSelector, WriteOnly,
 };
 
 #[cfg(feature = "trace")]
@@ -21,11 +28,11 @@ use crate::{
     binding_model::{BindGroup, BindingError},
     device::{
         queue, resource::DeferredDestroy, BufferMapPendingClosure, Device, DeviceError,
-        DeviceMismatch, HostMap, MissingDownlevelFlags, MissingFeatures,
+        DeviceMismatch, MissingDownlevelFlags, MissingFeatures,
     },
     hal_label,
     init_tracker::{BufferInitTracker, TextureInitTracker},
-    lock::{rank, Mutex, RwLock},
+    lock::{rank, Mutex, MutexGuard, RwLock},
     ray_tracing::{BlasCompactReadyPendingClosure, BlasPrepareCompactError},
     resource_log,
     snatch::{SnatchGuard, Snatchable},
@@ -255,7 +262,7 @@ pub(crate) enum BufferMapState {
     Active {
         mapping: hal::BufferMapping,
         range: hal::MemoryRange,
-        host: HostMap,
+        host: MapMode,
     },
     /// Not mapped
     Idle,
@@ -266,24 +273,80 @@ unsafe impl Send for BufferMapState {}
 #[cfg(send_sync)]
 unsafe impl Sync for BufferMapState {}
 
+/// Represents a mapped range in the buffer.
+///
+/// While returned [`BufferMapping`] is alive, [`Buffer::destroy`] and [`Buffer::unmap`] calls will block until [`BufferMapping`] is dropped.
+#[derive(Debug)]
+pub struct BufferMapping {
+    ptr: NonNull<u8>,
+    len: u64,
+    mode: MapMode,
+    // guard needs to be dropped before the lock
+    _guard: wgpu_sync::RwLockReadGuard<'static, BufferMapState>,
+    _lock: Arc<RwLock<BufferMapState>>,
+}
+
+impl BufferMapping {
+    fn new(ptr: NonNull<u8>, len: u64, mode: MapMode, lock: Arc<RwLock<BufferMapState>>) -> Self {
+        // SAFETY: We want to bypass the lock ranking system here,
+        // because the lock is exposed to users.
+        let guard = unsafe { lock.underlying() }.read();
+        Self {
+            ptr,
+            len,
+            mode,
+            // SAFETY: Guard is tied to the lifetime of the lock,
+            // and it will be dropped before the lock.
+            _guard: unsafe {
+                mem::transmute::<
+                    wgpu_sync::RwLockReadGuard<'_, BufferMapState>,
+                    wgpu_sync::RwLockReadGuard<'static, BufferMapState>,
+                >(guard)
+            },
+            _lock: lock,
+        }
+    }
+
+    /// ### How to safely use the pointer
+    ///
+    /// - Pointer is only accessed for the length returned by [`BufferMapping::len`].
+    /// - Pointer is only accessed while [`BufferMapping`] is alive.
+    /// - Reading is allowed if [`BufferMapping::mode`] is [`MapMode::Read`] (buffer has [`wgt::BufferUsages::MAP_READ`] set).
+    /// - Writing is allowed if [`BufferMapping::mode`] is [`MapMode::Write`] (buffer has [`wgt::BufferUsages::MAP_WRITE`] set).
+    /// - Atomics must not be used through the pointer since read-modify-write operations may not function on write-combining memory.
+    ///   This also means that it's not safe to create mutable rust references from this pointer since rust's memory model requires atomic operations to work.
+    pub fn ptr(&self) -> NonNull<u8> {
+        self.ptr
+    }
+
+    pub fn mode(&self) -> MapMode {
+        self.mode
+    }
+
+    #[expect(clippy::len_without_is_empty)]
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Returns a read-only slice to the mapped buffer.
+    /// [`BufferMapping::mode`] must be [`MapMode::Read`] (buffer has [`wgt::BufferUsages::MAP_READ`] set) otherwise it will panic.
+    pub fn read_slice(&self) -> &[u8] {
+        assert!(self.mode == MapMode::Read);
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len as usize) }
+    }
+
+    /// Returns a write-only slice to the mapped buffer.
+    /// [`BufferMapping::mode`] must be [`MapMode::Write`] (buffer has [`wgt::BufferUsages::MAP_WRITE`] set) otherwise it will panic.
+    pub fn write_slice(&'_ self) -> WriteOnly<'_, [u8]> {
+        assert!(self.mode == MapMode::Write);
+        unsafe { WriteOnly::new(NonNull::slice_from_raw_parts(self.ptr, self.len as usize)) }
+    }
+}
+
 #[cfg(send_sync)]
 pub type BufferMapCallback = Box<dyn FnOnce(BufferAccessResult) + Send + 'static>;
 #[cfg(not(send_sync))]
 pub type BufferMapCallback = Box<dyn FnOnce(BufferAccessResult) + 'static>;
-
-pub struct BufferMapOperation {
-    pub host: HostMap,
-    pub callback: Option<BufferMapCallback>,
-}
-
-impl fmt::Debug for BufferMapOperation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BufferMapOperation")
-            .field("host", &self.host)
-            .field("callback", &self.callback.as_ref().map(|_| "?"))
-            .finish()
-    }
-}
 
 #[derive(Clone, Debug, Error)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -351,6 +414,41 @@ pub enum BufferAccessError {
         size: wgt::BufferAddress,
         buffer_size: wgt::BufferAddress,
     },
+    #[error(transparent)]
+    InvalidMapMode(#[from] BadMapMode),
+}
+
+#[derive(Clone, Debug, Error)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[error("Invalid map mode: {0:?}, exactly one of READ or WRITE map mode must be set")]
+pub struct BadMapMode(MapModeFlags);
+
+bitflags::bitflags! {
+    /// Corresponds to [WebGPU `GPUMapModeFlags`](https://gpuweb.github.io/gpuweb/#dictdef-gpumapmodeflags).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+    pub struct MapModeFlags: u32 {
+        const READ = 0x0001;
+        const WRITE = 0x0002;
+    }
+}
+
+impl From<core::convert::Infallible> for BadMapMode {
+    fn from(_: core::convert::Infallible) -> Self {
+        unreachable!()
+    }
+}
+
+impl TryFrom<MapModeFlags> for MapMode {
+    type Error = BadMapMode;
+
+    fn try_from(mode: MapModeFlags) -> Result<Self, Self::Error> {
+        match mode {
+            m if m == MapModeFlags::READ => Ok(MapMode::Read),
+            m if m == MapModeFlags::WRITE => Ok(MapMode::Write),
+            m => Err(BadMapMode(m)),
+        }
+    }
 }
 
 impl WebGpuError for BufferAccessError {
@@ -373,7 +471,8 @@ impl WebGpuError for BufferAccessError {
             | Self::OutOfBoundsEndOffsetOverrun { .. }
             | Self::MapAborted
             | Self::MapStartOffsetOverrun { .. }
-            | Self::MapEndOffsetOverrun { .. } => ErrorType::Validation,
+            | Self::MapEndOffsetOverrun { .. }
+            | Self::InvalidMapMode(_) => ErrorType::Validation,
         }
     }
 }
@@ -429,55 +528,37 @@ impl WebGpuError for InvalidResourceError {
     }
 }
 
-pub enum Fallible<T: ParentDevice> {
-    Valid(Arc<T>),
-    Invalid(Arc<String>),
-}
+pub type BufferAccessResult = Result<MapMode, BufferAccessError>;
 
-impl<T: ParentDevice> Fallible<T> {
-    pub fn get(self) -> Result<Arc<T>, InvalidResourceError> {
-        match self {
-            Fallible::Valid(v) => Ok(v),
-            Fallible::Invalid(label) => Err(InvalidResourceError(ResourceErrorIdent {
-                r#type: Cow::Borrowed(T::TYPE),
-                label: (*label).clone(),
-            })),
-        }
-    }
-}
-
-impl<T: ParentDevice> Clone for Fallible<T> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Valid(v) => Self::Valid(v.clone()),
-            Self::Invalid(l) => Self::Invalid(l.clone()),
-        }
-    }
-}
-
-impl<T: ParentDevice> ResourceType for Fallible<T> {
-    const TYPE: &'static str = T::TYPE;
-}
-
-impl<T: ParentDevice + crate::storage::StorageItem> crate::storage::StorageItem for Fallible<T> {
-    type Marker = T::Marker;
-}
-
-pub type BufferAccessResult = Result<(), BufferAccessError>;
-
-#[derive(Debug)]
 pub(crate) struct BufferPendingMapping {
     pub(crate) range: Range<wgt::BufferAddress>,
-    pub(crate) op: BufferMapOperation,
+    pub(crate) callback: Option<BufferMapCallback>,
+    pub(crate) mode: MapMode,
     // hold the parent alive while the mapping is active
     pub(crate) _parent_buffer: Arc<Buffer>,
+}
+
+impl fmt::Debug for BufferPendingMapping {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BufferPendingMapping")
+            .field("range", &self.range)
+            .field("callback", &self.callback.as_ref().map(|_| "?"))
+            .field("mode", &self.mode)
+            .field("_parent_buffer", &self._parent_buffer)
+            .finish()
+    }
 }
 
 pub type BufferDescriptor<'a> = wgt::BufferDescriptor<Label<'a>>;
 
 #[derive(Debug)]
-pub struct Buffer {
+pub(crate) struct BufferState {
     pub(crate) raw: Snatchable<Box<dyn hal::DynBuffer>>,
+}
+
+#[derive(Debug)]
+pub struct Buffer {
+    pub(crate) state: ResourceState<BufferState>,
     pub(crate) device: Arc<Device>,
     pub(crate) usage: wgt::BufferUsages,
     pub(crate) size: wgt::BufferAddress,
@@ -485,7 +566,7 @@ pub struct Buffer {
     /// The `label` from the descriptor used to create the resource.
     pub(crate) label: String,
     pub(crate) tracking_data: TrackingData,
-    pub(crate) map_state: Mutex<BufferMapState>,
+    pub(crate) map_state: Arc<RwLock<BufferMapState>>,
     // Bind groups that reference this buffer. May contain duplicates.
     pub(crate) bind_groups: Mutex<WeakVec<BindGroup>>,
     pub(crate) timestamp_normalization_bind_group: Snatchable<TimestampNormalizationBindGroup>,
@@ -493,7 +574,15 @@ pub struct Buffer {
 }
 
 impl Drop for Buffer {
+    #[allow(trivial_casts)]
     fn drop(&mut self) {
+        profiling::scope!("Buffer::drop");
+        api_log!("Buffer::drop {:?}", self as *const _);
+        #[cfg(feature = "trace")]
+        if let Some(t) = self.device.trace.lock().as_mut() {
+            t.add(trace::Action::DropBuffer(unsafe { trace::to_trace(self) }));
+        }
+
         if let Some(raw) = self.timestamp_normalization_bind_group.take() {
             raw.dispose(self.device.raw());
         }
@@ -502,7 +591,35 @@ impl Drop for Buffer {
             raw.dispose(self.device.raw());
         }
 
-        if let Some(raw) = self.raw.take() {
+        let map_state = mem::replace(&mut *self.map_state.write(), BufferMapState::Idle);
+        let active_map = match map_state {
+            BufferMapState::Init { staging_buffer } => {
+                staging_buffer.dispose();
+                false
+            }
+            BufferMapState::Waiting(buffer_pending_mapping) => {
+                if buffer_pending_mapping.callback.is_some() {
+                    let result = Err(BufferAccessError::DestroyedResource(
+                        DestroyedResourceError(self.error_ident()),
+                    ));
+                    self.device
+                        .deferred_buffer_map_pending_closures
+                        .push((buffer_pending_mapping.callback, result));
+                }
+                false
+            }
+            BufferMapState::Active { .. } => true,
+            BufferMapState::Idle => false,
+        };
+
+        let ResourceState::Valid(state) = &mut self.state else {
+            return;
+        };
+
+        if let Some(raw) = state.raw.take() {
+            if active_map {
+                unsafe { self.device.raw().unmap_buffer(raw.as_ref()) }
+            }
             resource_log!("Destroy raw {}", self.error_ident());
             unsafe {
                 self.device.raw().destroy_buffer(raw);
@@ -515,7 +632,9 @@ impl RawResourceAccess for Buffer {
     type DynResource = dyn hal::DynBuffer;
 
     fn raw<'a>(&'a self, guard: &'a SnatchGuard) -> Option<&'a Self::DynResource> {
-        self.raw.get(guard).map(|b| b.as_ref())
+        self.state()
+            .ok()
+            .and_then(|state| state.raw.get(guard).map(|b| b.as_ref()))
     }
 }
 
@@ -524,7 +643,11 @@ impl Buffer {
         &self,
         guard: &SnatchGuard,
     ) -> Result<(), DestroyedResourceError> {
-        self.raw
+        let ResourceState::Valid(state) = &self.state else {
+            return Ok(());
+        };
+        state
+            .raw
             .get(guard)
             .map(|_| ())
             .ok_or_else(|| DestroyedResourceError(self.error_ident()))
@@ -547,6 +670,36 @@ impl Buffer {
         }
     }
 
+    pub(crate) fn state(&self) -> Result<&BufferState, InvalidResourceError> {
+        match &self.state {
+            ResourceState::Valid(state) => Ok(state),
+            ResourceState::Invalid => Err(InvalidResourceError(self.error_ident())),
+        }
+    }
+
+    pub(crate) fn check_is_valid(&self) -> Result<(), InvalidResourceError> {
+        self.state().map(|_| ())
+    }
+
+    pub fn invalid(device: Arc<Device>, desc: &BufferDescriptor) -> Arc<Self> {
+        Arc::new(Buffer {
+            state: ResourceState::Invalid,
+            usage: desc.usage,
+            size: desc.size,
+            initialization_status: RwLock::new(
+                rank::BUFFER_INITIALIZATION_STATUS,
+                BufferInitTracker::new(0),
+            ),
+            map_state: Arc::new(RwLock::new(rank::BUFFER_MAP_STATE, BufferMapState::Idle)),
+            label: desc.label.to_string(),
+            tracking_data: TrackingData::new(device.tracker_indices.buffers.clone()),
+            bind_groups: Mutex::new(rank::BUFFER_BIND_GROUPS, WeakVec::new()),
+            timestamp_normalization_bind_group: Snatchable::empty(),
+            indirect_validation_bind_groups: Snatchable::empty(),
+            device,
+        })
+    }
+
     /// Resolve the size of a binding for buffer with `offset` and `size`.
     ///
     /// If `size` is `None`, then the remainder of the buffer starting from
@@ -554,36 +707,73 @@ impl Buffer {
     ///
     /// If the binding would overflow the buffer, then an error is returned.
     ///
-    /// Zero-size bindings are permitted here for historical reasons. Although
-    /// zero-size bindings are permitted by WebGPU, they are not permitted by
-    /// some backends. See [`Buffer::binding`] and
-    /// [#3170](https://github.com/gfx-rs/wgpu/issues/3170).
-    pub fn resolve_binding_size(
+    /// `S` is `wgt::BufferSize` (`NonZeroU64`) when called from [`Buffer::binding`]
+    /// for a storage or uniform buffer binding. `S` is `wgt::BufferAddress` (`u64`)
+    /// when called from `resolve_vertex_or_index_binding_range` for a vertex or
+    /// index buffer binding.
+    fn resolve_binding_size<S: Copy + Into<wgt::BufferAddress> + TryFrom<wgt::BufferAddress>>(
         &self,
         offset: wgt::BufferAddress,
-        binding_size: Option<wgt::BufferSize>,
-    ) -> Result<u64, BindingError> {
+        binding_size: Option<S>,
+    ) -> Result<S, BindingError> {
         let buffer_size = self.size;
 
         match binding_size {
-            Some(binding_size) => match offset.checked_add(binding_size.get()) {
-                Some(end) if end <= buffer_size => Ok(binding_size.get()),
+            Some(binding_size) => match offset.checked_add(binding_size.into()) {
+                Some(end) if end <= buffer_size => Ok(binding_size),
                 _ => Err(BindingError::BindingRangeTooLarge {
                     buffer: self.error_ident(),
                     offset,
-                    binding_size: binding_size.get(),
+                    binding_size: binding_size.into(),
                     buffer_size,
                 }),
             },
-            None => {
-                buffer_size
-                    .checked_sub(offset)
-                    .ok_or_else(|| BindingError::BindingOffsetTooLarge {
-                        buffer: self.error_ident(),
-                        offset,
-                        buffer_size,
-                    })
-            }
+            None => buffer_size
+                .checked_sub(offset)
+                .and_then(|remaining| S::try_from(remaining).ok())
+                .ok_or_else(|| {
+                    if offset <= buffer_size {
+                        debug_assert_eq!(offset, buffer_size);
+                        BindingError::BindingOffsetEqualsSize {
+                            buffer: self.error_ident(),
+                            offset,
+                            buffer_size,
+                        }
+                    } else {
+                        BindingError::BindingOffsetTooLarge {
+                            buffer: self.error_ident(),
+                            offset,
+                            buffer_size,
+                        }
+                    }
+                }),
+        }
+    }
+
+    /// Resolve the binding range for a vertex or index buffer.
+    ///
+    /// This function is for vertex and index buffer bindings, which WebGPU
+    /// allows to have zero size. For storage and uniform buffer bindings,
+    /// which must have non-zero size, use [`Buffer::binding`].
+    ///
+    /// Returns an error if the binding would overflow the buffer.
+    pub fn resolve_vertex_or_index_binding_range(
+        &self,
+        offset: wgt::BufferAddress,
+        size: Option<wgt::BufferAddress>,
+    ) -> Result<Range<wgt::BufferAddress>, BindingError> {
+        let resolved_size = self.resolve_binding_size(offset, size)?;
+        if resolved_size != 0 {
+            Ok(offset..offset + resolved_size)
+        } else {
+            // Relocate zero-size binding to end of buffer, because hal does not support
+            // zero-size bindings (ignores end offsets). `create_buffer` must have
+            // ensured sufficient padding.
+            const _: () = {
+                assert!(wgt::VERTEX_ALIGNMENT == wgt::COPY_BUFFER_ALIGNMENT);
+            };
+            let target = align_to(self.size, wgt::VERTEX_ALIGNMENT);
+            Ok(target..target)
         }
     }
 
@@ -593,32 +783,24 @@ impl Buffer {
     /// If `binding_size` is `None`, then the remainder of the buffer starting
     /// from `offset` is used.
     ///
-    /// If the binding would overflow the buffer, then an error is returned.
+    /// Returns an error if the binding would overflow the buffer.
     ///
-    /// A zero-size binding at the end of the buffer is permitted here for historical reasons. Although
-    /// zero-size bindings are permitted by WebGPU, they are not permitted by
-    /// some backends. The zero-size binding need to be quashed or remapped to a
-    /// non-zero size, either universally in wgpu-core, or in specific backends
-    /// that do not support them. See
-    /// [#3170](https://github.com/gfx-rs/wgpu/issues/3170).
-    ///
-    /// Although it seems like it would be simpler and safer to use the resolved
-    /// size in the returned [`hal::BufferBinding`], doing this (and removing
-    /// redundant logic in backends to resolve the implicit size) was observed
-    /// to cause problems in certain CTS tests, so an implicit size
-    /// specification is preserved in the output.
+    /// This function is for storage and uniform buffer bindings, which must have
+    /// non-zero size. For vertex and index buffer bindings, which may have zero
+    /// size, use [`Buffer::resolve_vertex_or_index_binding_range`].
     pub fn binding<'a>(
         &'a self,
         offset: wgt::BufferAddress,
         binding_size: Option<wgt::BufferSize>,
         snatch_guard: &'a SnatchGuard,
-    ) -> Result<(hal::BufferBinding<'a, dyn hal::DynBuffer>, u64), BindingError> {
+    ) -> Result<hal::BufferBinding<'a, dyn hal::DynBuffer, wgt::BufferSize>, BindingError> {
         let buf_raw = self.try_raw(snatch_guard)?;
         let resolved_size = self.resolve_binding_size(offset, binding_size)?;
         // SAFETY: The offset and size passed to hal::BufferBinding::new_unchecked must
         // define a binding contained within the buffer.
-        Ok((
-            hal::BufferBinding::new_unchecked(buf_raw, offset, binding_size),
+        Ok(hal::BufferBinding::new_unchecked(
+            buf_raw,
+            offset,
             resolved_size,
         ))
     }
@@ -626,19 +808,32 @@ impl Buffer {
     /// Schedule buffer mapping.
     ///
     /// `op.callback` is guaranteed to be called, regardless of the outcome.
-    pub fn map_async(
+    pub fn map_async<M>(
         self: &Arc<Self>,
+        mode: M,
         offset: wgt::BufferAddress,
         size: Option<wgt::BufferAddress>,
-        op: BufferMapOperation,
-    ) -> Result<SubmissionIndex, BufferAccessError> {
-        self.try_map_async(offset, size, op)
-            .map_err(|(mut operation, err)| {
-                if let Some(callback) = operation.callback.take() {
-                    callback(Err(err.clone()));
+        callback: Option<BufferMapCallback>,
+    ) -> Option<SubmissionIndex>
+    where
+        M: fmt::Debug + TryInto<MapMode> + Copy,
+        M::Error: Into<BadMapMode>,
+    {
+        profiling::scope!("Buffer::map_async");
+        api_log!(
+            "Buffer::map_async {:?} mode {mode:?} offset {offset:?} size {size:?}",
+            Arc::as_ptr(self)
+        );
+
+        self.try_map_async(mode, offset, size, callback)
+            .map_err(|(mut callback, err)| {
+                self.device
+                    .handle_error(err.clone(), Some(&self.label), "Buffer::map_async");
+                if let Some(callback) = callback.take() {
+                    callback(Err(err));
                 }
-                err
             })
+            .ok()
     }
 
     /// Try to schedule buffer mapping.
@@ -663,28 +858,45 @@ impl Buffer {
     ///
     /// A return value of `Ok(0)` means that mapping does not need to wait on the queue, but
     /// it does not mean that the buffer has already been mapped.
-    fn try_map_async(
+    fn try_map_async<M>(
         self: &Arc<Self>,
+        mode: M,
         offset: wgt::BufferAddress,
         size: Option<wgt::BufferAddress>,
-        op: BufferMapOperation,
-    ) -> Result<SubmissionIndex, (BufferMapOperation, BufferAccessError)> {
+        callback: Option<BufferMapCallback>,
+    ) -> Result<SubmissionIndex, (Option<BufferMapCallback>, BufferAccessError)>
+    where
+        M: fmt::Debug + TryInto<MapMode> + Copy,
+        M::Error: Into<BadMapMode>,
+    {
         let range_size = if let Some(size) = size {
             size
         } else {
             self.size.saturating_sub(offset)
         };
 
+        let device = &self.device;
+        if let Err(e) = device.check_is_valid() {
+            return Err((callback, e.into()));
+        }
+
+        if let Err(e) = self.check_is_valid() {
+            return Err((callback, e.into()));
+        }
+
         if !offset.is_multiple_of(wgt::MAP_ALIGNMENT) {
-            return Err((op, BufferAccessError::UnalignedOffset { offset }));
+            return Err((callback, BufferAccessError::UnalignedOffset { offset }));
         }
         if !range_size.is_multiple_of(wgt::COPY_BUFFER_ALIGNMENT) {
-            return Err((op, BufferAccessError::UnalignedRangeSize { range_size }));
+            return Err((
+                callback,
+                BufferAccessError::UnalignedRangeSize { range_size },
+            ));
         }
 
         if offset > self.size {
             return Err((
-                op,
+                callback,
                 BufferAccessError::MapStartOffsetOverrun {
                     offset,
                     buffer_size: self.size,
@@ -694,7 +906,7 @@ impl Buffer {
         // NOTE: Should never underflow because of our earlier check.
         if range_size > self.size - offset {
             return Err((
-                op,
+                callback,
                 BufferAccessError::MapEndOffsetOverrun {
                     offset,
                     size: range_size,
@@ -707,41 +919,42 @@ impl Buffer {
         if !offset.is_multiple_of(wgt::MAP_ALIGNMENT)
             || !end_offset.is_multiple_of(wgt::COPY_BUFFER_ALIGNMENT)
         {
-            return Err((op, BufferAccessError::UnalignedRange));
+            return Err((callback, BufferAccessError::UnalignedRange));
         }
 
-        let (pub_usage, internal_use) = match op.host {
-            HostMap::Read => (wgt::BufferUsages::MAP_READ, wgt::BufferUses::MAP_READ),
-            HostMap::Write => (wgt::BufferUsages::MAP_WRITE, wgt::BufferUses::MAP_WRITE),
+        let mode = match mode.try_into() {
+            Ok(mode) => mode,
+            Err(e) => return Err((callback, e.into().into())),
+        };
+
+        let (pub_usage, internal_use) = match mode {
+            MapMode::Read => (wgt::BufferUsages::MAP_READ, wgt::BufferUses::MAP_READ),
+            MapMode::Write => (wgt::BufferUsages::MAP_WRITE, wgt::BufferUses::MAP_WRITE),
         };
 
         if let Err(e) = self.check_usage(pub_usage) {
-            return Err((op, e.into()));
-        }
-
-        let device = &self.device;
-        if let Err(e) = device.check_is_valid() {
-            return Err((op, e.into()));
+            return Err((callback, e.into()));
         }
 
         let submit_index = {
             let snatch_guard = device.snatchable_lock.read();
             if let Err(e) = self.check_destroyed(&snatch_guard) {
-                return Err((op, e.into()));
+                return Err((callback, e.into()));
             }
 
             {
-                let map_state = &mut *self.map_state.lock();
+                let map_state = &mut *self.map_state.write();
                 *map_state = match *map_state {
                     BufferMapState::Init { .. } | BufferMapState::Active { .. } => {
-                        return Err((op, BufferAccessError::AlreadyMapped));
+                        return Err((callback, BufferAccessError::AlreadyMapped));
                     }
                     BufferMapState::Waiting(_) => {
-                        return Err((op, BufferAccessError::MapAlreadyPending));
+                        return Err((callback, BufferAccessError::MapAlreadyPending));
                     }
                     BufferMapState::Idle => BufferMapState::Waiting(BufferPendingMapping {
                         range: offset..end_offset,
-                        op,
+                        mode,
+                        callback,
                         _parent_buffer: self.clone(),
                     }),
                 };
@@ -750,11 +963,13 @@ impl Buffer {
             if let Some(queue) = device.get_queue().as_ref() {
                 match queue.flush_writes_for_buffer(self, snatch_guard) {
                     Err(err) => {
-                        let state = mem::replace(&mut *self.map_state.lock(), BufferMapState::Idle);
-                        let BufferMapState::Waiting(BufferPendingMapping { op, .. }) = state else {
+                        let state =
+                            mem::replace(&mut *self.map_state.write(), BufferMapState::Idle);
+                        let BufferMapState::Waiting(BufferPendingMapping { callback, .. }) = state
+                        else {
                             unreachable!();
                         };
-                        return Err((op, err));
+                        return Err((callback, err));
                     }
                     Ok(()) => {
                         // Schedule the buffer map in the  lifetime tracker.
@@ -791,19 +1006,30 @@ impl Buffer {
         } else {
             // We don't have a queue, so go ahead and map the buffer.
             // We can safely unwrap below since we just set the `map_state` to `BufferMapState::Waiting`.
-            let (mut operation, status) = self.map(&device.snatchable_lock.read()).unwrap();
-            if let Some(callback) = operation.callback.take() {
+            let (mut callback, status) = self.map(&device.snatchable_lock.read()).unwrap();
+            if let Some(callback) = callback.take() {
                 callback(status);
             }
             Ok(0)
         }
     }
 
+    /// Get a guarded pointer to the mapped range of the buffer.
+    ///
+    /// While returned [`BufferMapping`] is alive,
+    /// [`Buffer::destroy`] and [`Buffer::unmap`] calls will block until [`BufferMapping`] is dropped.
     pub fn get_mapped_range(
         self: &Arc<Self>,
         offset: wgt::BufferAddress,
         size: Option<wgt::BufferAddress>,
-    ) -> Result<(NonNull<u8>, u64), BufferAccessError> {
+    ) -> Result<BufferMapping, BufferAccessError> {
+        profiling::scope!("Buffer::get_mapped_range");
+        api_log!(
+            "Buffer::get_mapped_range {:?} offset {offset:?} size {size:?}",
+            Arc::as_ptr(self)
+        );
+
+        self.check_is_valid()?;
         {
             let snatch_guard = self.device.snatchable_lock.read();
             self.check_destroyed(&snatch_guard)?;
@@ -821,7 +1047,7 @@ impl Buffer {
         if !range_size.is_multiple_of(wgt::COPY_BUFFER_ALIGNMENT) {
             return Err(BufferAccessError::UnalignedRangeSize { range_size });
         }
-        let map_state = &*self.map_state.lock();
+        let map_state = &*self.map_state.read();
         match *map_state {
             BufferMapState::Init { ref staging_buffer } => {
                 if offset > self.size {
@@ -840,12 +1066,17 @@ impl Buffer {
                 }
                 let ptr = unsafe { staging_buffer.ptr() };
                 let ptr = unsafe { NonNull::new_unchecked(ptr.as_ptr().offset(offset as isize)) };
-                Ok((ptr, range_size))
+                Ok(BufferMapping::new(
+                    ptr,
+                    range_size,
+                    MapMode::Write,
+                    self.map_state.clone(),
+                ))
             }
             BufferMapState::Active {
                 ref mapping,
                 ref range,
-                ..
+                ref host,
             } => {
                 if offset > range.end {
                     return Err(BufferAccessError::OutOfBoundsStartOffsetOverrun {
@@ -870,9 +1101,11 @@ impl Buffer {
                 // rather than the beginning of the buffer.
                 let relative_offset = (offset - range.start) as isize;
                 unsafe {
-                    Ok((
+                    Ok(BufferMapping::new(
                         NonNull::new_unchecked(mapping.ptr.as_ptr().offset(relative_offset)),
                         range_size,
+                        *host,
+                        self.map_state.clone(),
                     ))
                 }
             }
@@ -883,24 +1116,31 @@ impl Buffer {
     /// Other errors are returned within `BufferMapPendingClosure`.
     #[must_use]
     pub(crate) fn map(&self, snatch_guard: &SnatchGuard) -> Option<BufferMapPendingClosure> {
-        // This _cannot_ be inlined into the match. If it is, the lock will be held
-        // open through the whole match, resulting in a deadlock when we try to re-lock
-        // the buffer back to active.
-        let mapping = mem::replace(&mut *self.map_state.lock(), BufferMapState::Idle);
-        let pending_mapping = match mapping {
+        // Hold the lock on `map_state` until we have updated it with the
+        // outcome of the mapping, to prevent concurrent activity from
+        // observing an intermediate state.
+        //
+        // Unfortunately this does mean that we hold the guard across
+        // `crate::device::map_buffer` and the associated call to
+        // `handle_hal_error`, which may invoke a device loss callback.
+        // See <https://github.com/gfx-rs/wgpu/issues/10031>.
+        let mut map_state = self.map_state.write();
+        let pending_mapping = match mem::replace(&mut *map_state, BufferMapState::Idle) {
             BufferMapState::Waiting(pending_mapping) => pending_mapping,
             // Mapping cancelled
             BufferMapState::Idle => return None,
             // Mapping queued at least twice by map -> unmap -> map
             // and was already successfully mapped below
-            BufferMapState::Active { .. } => {
-                *self.map_state.lock() = mapping;
+            mapping @ BufferMapState::Active { .. } => {
+                *map_state = mapping;
                 return None;
             }
             _ => panic!("No pending mapping."),
         };
-        let status = if pending_mapping.range.start != pending_mapping.range.end {
-            let host = pending_mapping.op.host;
+        let status = if let Err(error) = self.device.check_is_valid() {
+            Err(error.into())
+        } else if pending_mapping.range.start != pending_mapping.range.end {
+            let host = pending_mapping.mode;
             let size = pending_mapping.range.end - pending_mapping.range.start;
             match crate::device::map_buffer(
                 self,
@@ -910,47 +1150,62 @@ impl Buffer {
                 snatch_guard,
             ) {
                 Ok(mapping) => {
-                    *self.map_state.lock() = BufferMapState::Active {
+                    *map_state = BufferMapState::Active {
                         mapping,
                         range: pending_mapping.range.clone(),
                         host,
                     };
-                    Ok(())
+                    Ok(host)
                 }
                 Err(e) => Err(e),
             }
         } else {
-            *self.map_state.lock() = BufferMapState::Active {
+            *map_state = BufferMapState::Active {
                 mapping: hal::BufferMapping {
                     ptr: NonNull::dangling(),
                     is_coherent: true,
                 },
                 range: pending_mapping.range,
-                host: pending_mapping.op.host,
+                host: pending_mapping.mode,
             };
-            Ok(())
+            Ok(pending_mapping.mode)
         };
-        Some((pending_mapping.op, status))
+        Some((pending_mapping.callback, status))
     }
 
     // Note: This must not be called while holding a lock.
-    pub fn unmap(self: &Arc<Self>) -> Result<(), BufferAccessError> {
-        if let Some((mut operation, status)) = self.unmap_inner()? {
-            if let Some(callback) = operation.callback.take() {
+    pub fn unmap(self: &Arc<Self>) {
+        profiling::scope!("unmap", "Buffer");
+        api_log!("Buffer::unmap {:?}", Arc::as_ptr(self));
+        if let Some((mut callback, status)) = self.unmap_inner() {
+            if let Some(callback) = callback.take() {
                 callback(status);
             }
         }
-
-        Ok(())
     }
 
-    fn unmap_inner(self: &Arc<Self>) -> Result<Option<BufferMapPendingClosure>, BufferAccessError> {
+    /// Per the WebGPU spec, unmap does not raise any errors
+    /// it just resolves any pending map_async calls with a MapAborted error.
+    /// It is okay to ignore errors because:
+    /// - if the buffer or device was invalid from the start it couldn't have been mapped via `map_async` anyway (no callback to resolve)
+    /// - if the device becomes invalid it calls the callback in `poll`/`maintain`
+    /// - if the buffer was destroyed (via `Buffer::destroy`) it was first unmapped
+    ///
+    /// <https://gpuweb.github.io/gpuweb/#dom-gpubuffer-unmap>
+    fn unmap_inner(self: &Arc<Self>) -> Option<BufferMapPendingClosure> {
         let device = &self.device;
         let snatch_guard = device.snatchable_lock.read();
-        let raw_buf = self.try_raw(&snatch_guard)?;
-        let map_state = mem::replace(&mut *self.map_state.lock(), BufferMapState::Idle);
+        // We can stop here if the buffer is invalid or destroyed because:
+        // - if the device was invalid from the start it couldn't have been mapped via `map_async` anyway
+        // - if the buffer was destroyed (via `Buffer::destroy`) it was first unmapped
+        let raw_buf = self.try_raw(&snatch_guard).ok()?;
+        let map_state = mem::replace(&mut *self.map_state.write(), BufferMapState::Idle);
         match map_state {
             BufferMapState::Init { staging_buffer } => {
+                if !self.device.is_valid() {
+                    staging_buffer.dispose();
+                    return None;
+                }
                 #[cfg(feature = "trace")]
                 if let Some(ref mut trace) = *device.trace.lock() {
                     use crate::device::trace::{DataKind, IntoTrace};
@@ -969,18 +1224,16 @@ impl Buffer {
                 let staging_buffer = staging_buffer.flush();
 
                 if let Some(queue) = device.get_queue() {
-                    let region = wgt::BufferSize::new(self.size).map(|size| hal::BufferCopy {
+                    // Copy the entire staging buffer, including any
+                    // zero-initialized padding.
+                    let region = Some(hal::BufferCopy {
                         src_offset: 0,
                         dst_offset: 0,
-                        size,
+                        size: staging_buffer.size,
                     });
-                    let transition_src = hal::BufferBarrier {
-                        buffer: staging_buffer.raw(),
-                        usage: hal::StateTransition {
-                            from: wgt::BufferUses::MAP_WRITE,
-                            to: wgt::BufferUses::COPY_SRC,
-                        },
-                    };
+                    // The staging buffer's `MAP_WRITE` -> `COPY_SRC` transition
+                    // is hoisted to the front of the batch by
+                    // `PendingWrites::consume`, below.
                     let transition_dst = hal::BufferBarrier::<dyn hal::DynBuffer> {
                         buffer: raw_buf,
                         usage: hal::StateTransition {
@@ -991,31 +1244,31 @@ impl Buffer {
                     let mut pending_writes = queue.pending_writes.lock();
                     let encoder = pending_writes.activate();
                     unsafe {
-                        encoder.transition_buffers(&[transition_src, transition_dst]);
-                        if self.size > 0 {
-                            encoder.copy_buffer_to_buffer(
-                                staging_buffer.raw(),
-                                raw_buf,
-                                region.as_slice(),
-                            );
-                        }
+                        encoder.transition_buffers(&[transition_dst]);
+                        // Buffers allocate at least `COPY_BUFFER_ALIGNMENT` bytes, so
+                        // there's always something to copy here.
+                        encoder.copy_buffer_to_buffer(
+                            staging_buffer.raw(),
+                            raw_buf,
+                            region.as_slice(),
+                        );
                     }
                     pending_writes.consume(staging_buffer);
                     pending_writes.insert_buffer(self);
                 }
+                None
             }
-            BufferMapState::Idle => {
-                return Err(BufferAccessError::NotMapped);
-            }
+            BufferMapState::Idle => None,
             BufferMapState::Waiting(pending) => {
-                return Ok(Some((pending.op, Err(BufferAccessError::MapAborted))));
+                Some((pending.callback, Err(BufferAccessError::MapAborted)))
             }
             BufferMapState::Active {
                 mapping,
                 range,
                 host,
             } => {
-                if host == HostMap::Write {
+                self.device.check_is_valid().ok()?;
+                if host == MapMode::Write {
                     #[cfg(feature = "trace")]
                     if let Some(ref mut trace) = *device.trace.lock() {
                         use crate::device::trace::{DataKind, IntoTrace};
@@ -1037,18 +1290,33 @@ impl Buffer {
                     }
                 }
                 unsafe { device.raw().unmap_buffer(raw_buf) };
+                None
             }
         }
-        Ok(None)
     }
 
     pub fn destroy(self: &Arc<Self>) {
+        profiling::scope!("Buffer::destroy");
+        api_log!("Buffer::destroy {:?}", Arc::as_ptr(self));
+
         let device = &self.device;
+
+        #[cfg(feature = "trace")]
+        if let Some(trace) = device.trace.lock().as_mut() {
+            use crate::device::trace::IntoTrace;
+            trace.add(trace::Action::DestroyBuffer(self.to_trace()));
+        }
+
+        let ResourceState::Valid(state) = &self.state else {
+            return;
+        };
+
+        self.unmap();
 
         let temp = {
             let mut snatch_guard = device.snatchable_lock.write();
 
-            let raw = match self.raw.snatch(&mut snatch_guard) {
+            let raw = match state.raw.snatch(&mut snatch_guard) {
                 Some(raw) => raw,
                 None => {
                     // Per spec, it is valid to call `destroy` multiple times.
@@ -1099,6 +1367,14 @@ impl Buffer {
             life_lock.schedule_resource_destruction(temp, last_submit_index);
         }
     }
+
+    pub fn size(&self) -> wgt::BufferAddress {
+        self.size
+    }
+
+    pub fn usage(&self) -> wgt::BufferUsages {
+        self.usage
+    }
 }
 
 #[derive(Clone, Debug, Error)]
@@ -1122,6 +1398,8 @@ pub enum CreateBufferError {
     MissingFeatures(#[from] MissingFeatures),
     #[error("Failed to create bind group for indirect buffer validation: {0}")]
     IndirectValidationBindGroup(DeviceError),
+    #[error("Error initializing buffer: {0}")]
+    QueueWrite(#[from] queue::QueueWriteError),
 }
 
 crate::impl_resource_type!(Buffer);
@@ -1138,6 +1416,7 @@ impl WebGpuError for CreateBufferError {
             Self::MissingDownlevelFlags(e) => e.webgpu_error_type(),
             Self::IndirectValidationBindGroup(e) => e.webgpu_error_type(),
             Self::MissingFeatures(e) => e.webgpu_error_type(),
+            Self::QueueWrite(e) => e.webgpu_error_type(),
 
             Self::UnalignedSize
             | Self::InvalidUsage(_)
@@ -1200,18 +1479,18 @@ unsafe impl Sync for StagingBuffer {}
 /// is always created mapped, and the command that uses it destroys the buffer
 /// when it is done.
 ///
-/// [`StagingBuffer`]s can be created with [`queue_create_staging_buffer`] and
-/// used with [`queue_write_staging_buffer`]. They are also used internally by
-/// operations like [`queue_write_texture`] that need to upload data to the GPU,
+/// [`StagingBuffer`]s can be created with [`Queue::create_staging_buffer`] and
+/// used with [`Queue::write_staging_buffer`]. They are also used internally by
+/// operations like [`Queue::write_texture`] that need to upload data to the GPU,
 /// but that don't belong to any particular wgpu command buffer.
 ///
 /// Used `StagingBuffer`s are accumulated in [`Device::pending_writes`], to be
 /// freed once their associated operation's queue submission has finished
 /// execution.
 ///
-/// [`queue_create_staging_buffer`]: crate::global::Global::queue_create_staging_buffer
-/// [`queue_write_staging_buffer`]: crate::global::Global::queue_write_staging_buffer
-/// [`queue_write_texture`]: crate::global::Global::queue_write_texture
+/// [`Queue::create_staging_buffer`]: crate::device::queue::Queue::create_staging_buffer
+/// [`Queue::write_staging_buffer`]: crate::device::queue::Queue::write_staging_buffer
+/// [`Queue::write_texture`]: crate::device::queue::Queue::write_texture
 /// [`Device::pending_writes`]: crate::device::Device
 #[derive(Debug)]
 pub struct StagingBuffer {
@@ -1232,7 +1511,7 @@ impl StagingBuffer {
             memory_flags: hal::MemoryFlags::TRANSIENT,
         };
 
-        let raw = unsafe { device.raw().create_buffer(&stage_desc) }
+        let (raw, _) = unsafe { device.raw().create_buffer(&stage_desc) }
             .map_err(|e| device.handle_hal_error(e))?;
         let mapping = unsafe { device.raw().map_buffer(raw.as_ref(), 0..size.get()) }
             .map_err(|e| device.handle_hal_error(e))?;
@@ -1248,10 +1527,15 @@ impl StagingBuffer {
         Ok(staging_buffer)
     }
 
-    /// SAFETY: You must not call any functions of `self`
+    /// # Safety
+    /// You must not call any functions of `self`
     /// until you stopped using the returned pointer.
-    pub(crate) unsafe fn ptr(&self) -> NonNull<u8> {
+    pub unsafe fn ptr(&self) -> NonNull<u8> {
         self.ptr
+    }
+
+    pub fn size(&self) -> wgt::BufferSize {
+        self.size
     }
 
     #[cfg(feature = "trace")]
@@ -1263,8 +1547,13 @@ impl StagingBuffer {
         unsafe { core::ptr::write_bytes(self.ptr.as_ptr(), 0, self.size.get() as usize) };
     }
 
-    pub(crate) fn write(&mut self, data: &[u8]) {
-        assert!(data.len() >= self.size.get() as usize);
+    /// Write the entire staging buffer.
+    ///
+    /// # Panics
+    ///
+    /// If `data.len()` is not equal to the size of the staging buffer.
+    pub(crate) fn write_exact(&mut self, data: &[u8]) {
+        assert_eq!(data.len(), self.size.get() as usize);
         // SAFETY: With the assert above, all of `copy_nonoverlapping`'s
         // requirements are satisfied.
         unsafe {
@@ -1272,6 +1561,25 @@ impl StagingBuffer {
                 data.as_ptr(),
                 self.ptr.as_ptr(),
                 self.size.get() as usize,
+            );
+        }
+    }
+
+    /// Write `data` to the staging buffer, filling any remainder with zeros.
+    ///
+    /// # Panics
+    ///
+    /// If `data` exceeds the size of the staging buffer.
+    pub(crate) fn write_with_zero_padding(&mut self, data: &[u8]) {
+        assert!(data.len() <= self.size.get() as usize);
+        // SAFETY: The assert ensures the requirements of `copy_nonoverlapping`
+        // and `write_bytes` are satisfied.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.as_ptr(), data.len());
+            core::ptr::write_bytes(
+                self.ptr.as_ptr().add(data.len()),
+                0,
+                self.size.get() as usize - data.len(),
             );
         }
     }
@@ -1319,6 +1627,12 @@ impl StagingBuffer {
             device,
             size,
         }
+    }
+
+    pub(crate) fn dispose(self) {
+        let device = self.device.raw();
+        unsafe { device.unmap_buffer(self.raw.as_ref()) };
+        unsafe { device.destroy_buffer(self.raw) };
     }
 }
 
@@ -1442,8 +1756,8 @@ impl Texture {
         }
     }
 
-    pub(crate) fn invalid(device: &Arc<Device>, desc: &TextureDescriptor) -> Self {
-        Texture {
+    pub fn invalid(device: &Arc<Device>, desc: &TextureDescriptor) -> Arc<Self> {
+        Arc::new(Texture {
             state: ResourceState::Invalid,
             device: device.clone(),
             desc: desc.map_label(|label| label.to_string()),
@@ -1464,7 +1778,7 @@ impl Texture {
             clear_mode: RwLock::new(rank::TEXTURE_CLEAR_MODE, TextureClearMode::None),
             views: Mutex::new(rank::TEXTURE_VIEWS, WeakVec::new()),
             bind_groups: Mutex::new(rank::TEXTURE_BIND_GROUPS, WeakVec::new()),
-        }
+        })
     }
 
     /// Checks that the given texture usage contains the required texture usage,
@@ -1486,7 +1800,11 @@ impl Texture {
 }
 
 impl Drop for Texture {
+    #[allow(trivial_casts)]
     fn drop(&mut self) {
+        profiling::scope!("Texture::drop");
+        api_log!("Texture::drop {:?}", self as *const _);
+
         #[cfg(feature = "trace")]
         {
             let mut t = self.device.trace.lock();
@@ -1611,6 +1929,16 @@ impl Texture {
     }
 
     pub fn destroy(self: &Arc<Self>) {
+        profiling::scope!("Texture::destroy");
+        api_log!("Texture::destroy {:?}", Arc::as_ptr(self));
+
+        #[cfg(feature = "trace")]
+        if let Some(trace) = self.device.trace.lock().as_mut() {
+            use crate::device::trace::IntoTrace as _;
+
+            trace.add(trace::Action::DestroyTexture(self.to_trace()));
+        }
+
         let device = &self.device;
 
         let ResourceState::Valid(state) = &self.state else {
@@ -1665,6 +1993,433 @@ impl Texture {
         let last_submit_index = life_lock.get_texture_latest_submission_index(self);
         if let Some(last_submit_index) = last_submit_index {
             life_lock.schedule_resource_destruction(temp, last_submit_index);
+        }
+    }
+
+    fn create_view_inner(
+        self: &Arc<Self>,
+        desc: &TextureViewDescriptor,
+    ) -> Result<Arc<TextureView>, CreateTextureViewError> {
+        let device = &self.device;
+        device.check_is_valid()?;
+
+        if desc.swizzle != wgt::TextureComponentSwizzle::default() {
+            self.device
+                .require_features(wgt::Features::TEXTURE_COMPONENT_SWIZZLE)?;
+        }
+
+        let snatch_guard = device.snatchable_lock.read();
+
+        let texture_raw = self.try_inner(&snatch_guard)?.raw();
+
+        // resolve TextureViewDescriptor defaults
+        // https://gpuweb.github.io/gpuweb/#abstract-opdef-resolving-gputextureviewdescriptor-defaults
+        let resolved_format = desc.format.unwrap_or_else(|| {
+            self.desc
+                .format
+                .aspect_specific_format(desc.range.aspect)
+                .unwrap_or(self.desc.format)
+        });
+
+        let resolved_dimension = desc.dimension.unwrap_or_else(|| match self.desc.dimension {
+            wgt::TextureDimension::D1 => wgt::TextureViewDimension::D1,
+            wgt::TextureDimension::D2 => {
+                if self.desc.array_layer_count() == 1 {
+                    wgt::TextureViewDimension::D2
+                } else {
+                    wgt::TextureViewDimension::D2Array
+                }
+            }
+            wgt::TextureDimension::D3 => wgt::TextureViewDimension::D3,
+        });
+
+        let resolved_mip_level_count = desc.range.mip_level_count.unwrap_or_else(|| {
+            self.desc
+                .mip_level_count
+                .saturating_sub(desc.range.base_mip_level)
+        });
+
+        let resolved_array_layer_count =
+            desc.range
+                .array_layer_count
+                .unwrap_or_else(|| match resolved_dimension {
+                    wgt::TextureViewDimension::D1
+                    | wgt::TextureViewDimension::D2
+                    | wgt::TextureViewDimension::D3 => 1,
+                    wgt::TextureViewDimension::Cube => 6,
+                    wgt::TextureViewDimension::D2Array | wgt::TextureViewDimension::CubeArray => {
+                        self.desc
+                            .array_layer_count()
+                            .saturating_sub(desc.range.base_array_layer)
+                    }
+                });
+
+        let resolved_usage = {
+            let usage = desc.usage.unwrap_or(wgt::TextureUsages::empty());
+            if usage.is_empty() {
+                self.desc.usage
+            } else if self.desc.usage.contains(usage) {
+                // Transient texture usage subsetting is disallowed
+                if self
+                    .desc
+                    .usage
+                    .contains(wgt::TextureUsages::TRANSIENT_ATTACHMENT)
+                    && self.desc.usage != usage
+                {
+                    return Err(CreateTextureViewError::InvalidTransientTextureViewUsage {
+                        texture: self.desc.usage,
+                        view: usage,
+                    });
+                }
+
+                usage
+            } else {
+                return Err(CreateTextureViewError::InvalidTextureViewUsage {
+                    view: usage,
+                    texture: self.desc.usage,
+                });
+            }
+        };
+
+        let format_features = device.describe_format_features(resolved_format)?;
+        let allowed_format_usages = format_features.allowed_usages;
+        if resolved_usage.contains(wgt::TextureUsages::RENDER_ATTACHMENT)
+            && !allowed_format_usages.contains(wgt::TextureUsages::RENDER_ATTACHMENT)
+        {
+            return Err(CreateTextureViewError::TextureViewFormatNotRenderable(
+                resolved_format,
+            ));
+        }
+
+        if resolved_usage.contains(wgt::TextureUsages::STORAGE_BINDING)
+            && !allowed_format_usages.contains(wgt::TextureUsages::STORAGE_BINDING)
+        {
+            return Err(CreateTextureViewError::TextureViewFormatNotStorage(
+                resolved_format,
+            ));
+        }
+
+        // validate TextureViewDescriptor
+
+        let aspects = hal::FormatAspects::new(self.desc.format, desc.range.aspect);
+        if aspects.is_empty() {
+            return Err(CreateTextureViewError::InvalidAspect {
+                texture_format: self.desc.format,
+                requested_aspect: desc.range.aspect,
+            });
+        }
+
+        if desc.range.aspect == wgt::TextureAspect::All && resolved_format.is_multi_planar_format()
+        {
+            return Err(CreateTextureViewError::MultiplanarFullTexture(
+                resolved_format,
+            ));
+        }
+
+        if desc.range.aspect == wgt::TextureAspect::All {
+            if resolved_format != self.desc.format
+                && !self.desc.view_formats.contains(&resolved_format)
+            {
+                return Err(CreateTextureViewError::FormatReinterpretation {
+                    texture: self.desc.format,
+                    view: resolved_format,
+                });
+            }
+        } else {
+            let aspect_format = self.desc.format.aspect_specific_format(desc.range.aspect);
+            match aspect_format {
+                Some(aspect_format) if aspect_format == resolved_format => (),
+                Some(aspect_format) => {
+                    return Err(CreateTextureViewError::WrongAspectReinterpretation {
+                        texture: self.desc.format,
+                        aspect: desc.range.aspect,
+                        aspect_format,
+                        requested_format: resolved_format,
+                    })
+                }
+                None => {
+                    // User requested a sub-aspect (not TextureAspect::All) that is not on the texture.
+                    // This should've already returned with the InvalidAspect check above.
+                    unreachable!()
+                }
+            }
+        }
+
+        // check if multisampled texture is seen as anything but 2D
+        if self.desc.sample_count > 1 && resolved_dimension != wgt::TextureViewDimension::D2 {
+            // Multisample is allowed on 2D arrays, only if explicitly supported
+            let multisample_array_exception = resolved_dimension
+                == wgt::TextureViewDimension::D2Array
+                && device.features.contains(wgt::Features::MULTISAMPLE_ARRAY);
+
+            if !multisample_array_exception {
+                return Err(
+                    CreateTextureViewError::InvalidMultisampledTextureViewDimension(
+                        resolved_dimension,
+                    ),
+                );
+            }
+        }
+
+        // check if the dimension is compatible with the texture
+        if self.desc.dimension != resolved_dimension.compatible_texture_dimension() {
+            return Err(CreateTextureViewError::InvalidTextureViewDimension {
+                view: resolved_dimension,
+                texture: self.desc.dimension,
+            });
+        }
+
+        match resolved_dimension {
+            wgt::TextureViewDimension::D1
+            | wgt::TextureViewDimension::D2
+            | wgt::TextureViewDimension::D3
+                if resolved_array_layer_count != 1 =>
+            {
+                return Err(CreateTextureViewError::InvalidArrayLayerCount {
+                    requested: resolved_array_layer_count,
+                    dim: resolved_dimension,
+                });
+            }
+            wgt::TextureViewDimension::Cube if resolved_array_layer_count != 6 => {
+                return Err(CreateTextureViewError::InvalidCubemapTextureDepth {
+                    depth: resolved_array_layer_count,
+                });
+            }
+            wgt::TextureViewDimension::CubeArray
+                if !resolved_array_layer_count.is_multiple_of(6) =>
+            {
+                return Err(CreateTextureViewError::InvalidCubemapArrayTextureDepth {
+                    depth: resolved_array_layer_count,
+                });
+            }
+            _ => {}
+        }
+
+        match resolved_dimension {
+            wgt::TextureViewDimension::Cube | wgt::TextureViewDimension::CubeArray
+                if self.desc.size.width != self.desc.size.height =>
+            {
+                return Err(CreateTextureViewError::InvalidCubeTextureViewSize);
+            }
+            _ => {}
+        }
+
+        if resolved_mip_level_count == 0 {
+            return Err(CreateTextureViewError::ZeroMipLevelCount);
+        }
+
+        let mip_level_end = desc
+            .range
+            .base_mip_level
+            .saturating_add(resolved_mip_level_count);
+
+        let level_end = self.desc.mip_level_count;
+        if mip_level_end > level_end {
+            return Err(CreateTextureViewError::TooManyMipLevels {
+                base_mip_level: desc.range.base_mip_level,
+                mip_level_count: resolved_mip_level_count,
+                total: level_end,
+            });
+        }
+
+        if resolved_array_layer_count == 0 {
+            return Err(CreateTextureViewError::ZeroArrayLayerCount);
+        }
+
+        let array_layer_end = desc
+            .range
+            .base_array_layer
+            .saturating_add(resolved_array_layer_count);
+
+        let layer_end = self.desc.array_layer_count();
+        if array_layer_end > layer_end {
+            return Err(CreateTextureViewError::TooManyArrayLayers {
+                base_array_layer: desc.range.base_array_layer,
+                array_layer_count: resolved_array_layer_count,
+                total: layer_end,
+            });
+        };
+
+        // https://gpuweb.github.io/gpuweb/#abstract-opdef-renderable-texture-view
+        let render_extent = 'error: {
+            if !resolved_usage.contains(wgt::TextureUsages::RENDER_ATTACHMENT) {
+                break 'error Err(TextureViewNotRenderableReason::Usage(resolved_usage));
+            }
+
+            let allowed_view_dimensions = [
+                wgt::TextureViewDimension::D2,
+                wgt::TextureViewDimension::D2Array,
+                wgt::TextureViewDimension::D3,
+            ];
+            if !allowed_view_dimensions.contains(&resolved_dimension) {
+                break 'error Err(TextureViewNotRenderableReason::Dimension(
+                    resolved_dimension,
+                ));
+            }
+
+            if resolved_mip_level_count != 1 {
+                break 'error Err(TextureViewNotRenderableReason::MipLevelCount(
+                    resolved_mip_level_count,
+                ));
+            }
+
+            if resolved_array_layer_count != 1
+                && !(device.features.contains(wgt::Features::MULTIVIEW))
+            {
+                break 'error Err(TextureViewNotRenderableReason::ArrayLayerCount(
+                    resolved_array_layer_count,
+                ));
+            }
+
+            if !self.desc.format.is_multi_planar_format()
+                && aspects != hal::FormatAspects::from(self.desc.format)
+            {
+                break 'error Err(TextureViewNotRenderableReason::Aspects(aspects));
+            }
+
+            if desc.swizzle != wgt::TextureComponentSwizzle::default() {
+                break 'error Err(TextureViewNotRenderableReason::Swizzle(desc.swizzle));
+            }
+
+            Ok(self
+                .desc
+                .compute_render_extent(desc.range.base_mip_level, desc.range.aspect.to_plane()))
+        };
+
+        // filter the usages based on the other criteria
+        let usage = {
+            let resolved_hal_usage = crate::conv::map_texture_usage(
+                resolved_usage,
+                resolved_format.into(),
+                format_features.flags,
+            );
+            let mask_copy = !(wgt::TextureUses::COPY_SRC | wgt::TextureUses::COPY_DST);
+            let mask_dimension = match resolved_dimension {
+                wgt::TextureViewDimension::Cube | wgt::TextureViewDimension::CubeArray => {
+                    wgt::TextureUses::RESOURCE
+                }
+                wgt::TextureViewDimension::D3 => {
+                    wgt::TextureUses::RESOURCE
+                        | wgt::TextureUses::STORAGE_READ_ONLY
+                        | wgt::TextureUses::STORAGE_WRITE_ONLY
+                        | wgt::TextureUses::STORAGE_READ_WRITE
+                }
+                _ => wgt::TextureUses::all(),
+            };
+            let mask_mip_level = if resolved_mip_level_count == 1 {
+                wgt::TextureUses::all()
+            } else {
+                wgt::TextureUses::RESOURCE
+            };
+            resolved_hal_usage & mask_copy & mask_dimension & mask_mip_level
+        };
+
+        // use the combined depth-stencil format for the view
+        let format = if resolved_format.is_depth_stencil_component(self.desc.format) {
+            self.desc.format
+        } else {
+            resolved_format
+        };
+
+        let resolved_range = wgt::ImageSubresourceRange {
+            aspect: desc.range.aspect,
+            base_mip_level: desc.range.base_mip_level,
+            mip_level_count: Some(resolved_mip_level_count),
+            base_array_layer: desc.range.base_array_layer,
+            array_layer_count: Some(resolved_array_layer_count),
+        };
+
+        let hal_desc = hal::TextureViewDescriptor {
+            label: desc.label.to_hal(device.instance_flags),
+            format,
+            dimension: resolved_dimension,
+            usage,
+            range: resolved_range,
+            swizzle: desc.swizzle,
+        };
+
+        let raw = unsafe { device.raw().create_texture_view(texture_raw, &hal_desc) }
+            .map_err(|e| device.handle_hal_error(e))?;
+
+        let selector = TextureSelector {
+            mips: desc.range.base_mip_level..mip_level_end,
+            layers: desc.range.base_array_layer..array_layer_end,
+        };
+
+        let view = TextureView {
+            state: ResourceState::Valid(TextureViewState {
+                raw: Snatchable::new(raw),
+                render_extent,
+            }),
+            parent: self.clone(),
+            device: device.clone(),
+            desc: HalTextureViewDescriptor {
+                texture_format: self.desc.format,
+                format: resolved_format,
+                dimension: resolved_dimension,
+                usage: resolved_usage,
+                range: resolved_range,
+                swizzle: desc.swizzle,
+            },
+            format_features: self.format_features,
+            samples: self.desc.sample_count,
+            selector,
+            label: desc.label.to_string(),
+        };
+
+        let view = Arc::new(view);
+
+        {
+            let mut views = self.views.lock();
+            views.push(Arc::downgrade(&view));
+        }
+
+        Ok(view)
+    }
+
+    pub fn create_view(self: &Arc<Self>, desc: &TextureViewDescriptor) -> Arc<TextureView> {
+        profiling::scope!("Texture::create_view");
+
+        let view = self.create_view_inner(desc).unwrap_or_else(|err| {
+            self.device
+                .handle_error(err, desc.label.as_deref(), "Texture::create_view failed");
+            TextureView::invalid(&self.device, self, desc)
+        });
+
+        api_log!(
+            "Texture::create_view({:?}) -> {:?}",
+            Arc::as_ptr(self),
+            Arc::as_ptr(&view)
+        );
+
+        #[cfg(feature = "trace")]
+        if let Some(ref mut trace) = *self.device.trace.lock() {
+            use crate::device::trace;
+            use trace::IntoTrace as _;
+            trace.add(trace::Action::CreateTextureView {
+                id: view.to_trace(),
+                parent: self.to_trace(),
+                desc: desc.clone(),
+            });
+        }
+
+        view
+    }
+
+    pub fn descriptor(&self) -> &wgt::TextureDescriptor<String, Vec<wgt::TextureFormat>> {
+        &self.desc
+    }
+
+    /// Marks the texture's entire contents as already initialized,
+    /// skipping wgpu-core's lazy zero-initialization of it.
+    ///
+    /// # Safety
+    ///
+    /// The entire contents of the texture must already be initialized.
+    pub unsafe fn mark_externally_initialized(&self) {
+        let mut initialization_status = self.initialization_status.write();
+        for mip_tracker in initialization_status.mips.iter_mut() {
+            mip_tracker.drain(0..self.desc.array_layer_count());
         }
     }
 }
@@ -1895,6 +2650,10 @@ pub struct TextureViewDescriptor<'a> {
     pub usage: Option<wgt::TextureUsages>,
     /// Range within the texture that is accessible via this view.
     pub range: wgt::ImageSubresourceRange,
+    /// Texture component swizzle.
+    /// When the texture view is accessed by a shader, the red/green/blue/alpha channels are replaced
+    /// by the value corresponding to the component specified in [`wgt::TextureComponentSwizzle`].
+    pub swizzle: wgt::TextureComponentSwizzle,
 }
 
 #[derive(Debug)]
@@ -1904,6 +2663,7 @@ pub(crate) struct HalTextureViewDescriptor {
     pub usage: wgt::TextureUsages,
     pub dimension: wgt::TextureViewDimension,
     pub range: wgt::ImageSubresourceRange,
+    pub swizzle: wgt::TextureComponentSwizzle,
 }
 
 impl HalTextureViewDescriptor {
@@ -1926,6 +2686,8 @@ pub enum TextureViewNotRenderableReason {
         "The aspects of this texture view are a subset of the aspects in the original texture. Aspects: {0:?}"
     )]
     Aspects(hal::FormatAspects),
+    #[error("The texture view swizzle must be identity. View swizzle: {0:?}")]
+    Swizzle(wgt::TextureComponentSwizzle),
 }
 
 #[derive(Debug)]
@@ -2042,18 +2804,20 @@ impl TextureView {
                     wgt::TextureDimension::D3 => wgt::TextureViewDimension::D3,
                 }),
                 range: desc.range,
+                swizzle: desc.swizzle,
             },
             format_features: texture.format_features,
             samples: texture.desc.sample_count,
             selector: TextureSelector {
-                mips: desc.range.base_mip_level
-                    ..(desc.range.base_mip_level + desc.range.mip_level_count.unwrap_or_default()),
-                layers: desc.range.base_array_layer
-                    ..(desc.range.base_array_layer
-                        + desc.range.array_layer_count.unwrap_or_default()),
+                mips: desc.range.mip_range(texture.desc.mip_level_count),
+                layers: desc.range.layer_range(texture.desc.array_layer_count()),
             },
             label: desc.label.to_string(),
         })
+    }
+
+    pub fn texture(&self) -> &Arc<Texture> {
+        &self.parent
     }
 }
 
@@ -2141,6 +2905,19 @@ pub enum CreateTextureViewError {
     InvalidResource(#[from] InvalidResourceError),
     #[error(transparent)]
     MissingFeatures(#[from] MissingFeatures),
+
+    #[error(
+        "Trying to create a view of format {requested_format:?} on aspect {aspect:?} of format {texture:?}, \
+         but the actual format of this aspect is {aspect_format:?}"
+    )]
+    WrongAspectReinterpretation {
+        texture: wgt::TextureFormat,
+        aspect: wgt::TextureAspect,
+        aspect_format: wgt::TextureFormat,
+        requested_format: wgt::TextureFormat,
+    },
+    #[error("TextureAspect::All cannot be used in texture views on multi-planar formats")]
+    MultiplanarFullTexture(wgt::TextureFormat),
 }
 
 impl From<InvalidOrDestroyedResourceError> for CreateTextureViewError {
@@ -2175,7 +2952,9 @@ impl WebGpuError for CreateTextureViewError {
             | Self::TextureViewFormatNotStorage(_)
             | Self::InvalidTextureViewUsage { .. }
             | Self::InvalidTransientTextureViewUsage { .. }
-            | Self::MissingFeatures(_) => ErrorType::Validation,
+            | Self::MissingFeatures(_)
+            | Self::WrongAspectReinterpretation { .. }
+            | Self::MultiplanarFullTexture(_) => ErrorType::Validation,
         }
     }
 }
@@ -2188,27 +2967,70 @@ crate::impl_storage_item!(TextureView);
 pub type ExternalTextureDescriptor<'a> = wgt::ExternalTextureDescriptor<Label<'a>>;
 
 #[derive(Debug)]
-pub struct ExternalTexture {
-    pub(crate) device: Arc<Device>,
-    /// Between 1 and 3 (inclusive) planes of texture data.
-    pub(crate) planes: arrayvec::ArrayVec<Arc<TextureView>, 3>,
+pub(crate) struct ExternalTextureState {
     /// Buffer containing a [`crate::device::resource::ExternalTextureParams`]
     /// describing the external texture.
     pub(crate) params: Arc<Buffer>,
+}
+
+#[derive(Debug)]
+pub struct ExternalTexture {
+    pub(crate) state: ResourceState<ExternalTextureState>,
+    pub(crate) device: Arc<Device>,
+    /// Between 1 and 3 (inclusive) planes of texture data.
+    pub(crate) planes: arrayvec::ArrayVec<Arc<TextureView>, 3>,
     /// The `label` from the descriptor used to create the resource.
     pub(crate) label: String,
     pub(crate) tracking_data: TrackingData,
 }
 
 impl Drop for ExternalTexture {
+    #[allow(trivial_casts)]
     fn drop(&mut self) {
+        profiling::scope!("ExternalTexture::drop");
+        api_log!("ExternalTexture::drop {:?}", self as *const _);
+
         resource_log!("Destroy raw {}", self.error_ident());
+        #[cfg(feature = "trace")]
+        if let Some(t) = self.device.trace.lock().as_mut() {
+            t.add(trace::Action::DropExternalTexture(unsafe {
+                trace::to_trace(self)
+            }));
+        }
     }
 }
 
 impl ExternalTexture {
+    pub(crate) fn state(&self) -> Result<&ExternalTextureState, InvalidResourceError> {
+        match &self.state {
+            ResourceState::Valid(state) => Ok(state),
+            ResourceState::Invalid => Err(InvalidResourceError(self.error_ident())),
+        }
+    }
+
     pub fn destroy(self: &Arc<Self>) {
-        self.params.destroy();
+        profiling::scope!("ExternalTexture::destroy");
+        api_log!("ExternalTexture::destroy {:?}", Arc::as_ptr(self));
+
+        #[cfg(feature = "trace")]
+        if let Some(trace) = self.device.trace.lock().as_mut() {
+            use crate::device::trace::IntoTrace as _;
+
+            trace.add(trace::Action::DestroyExternalTexture(self.to_trace()));
+        }
+        if let Ok(state) = self.state() {
+            state.params.destroy();
+        }
+    }
+
+    pub fn invalid(device: Arc<Device>, desc: &ExternalTextureDescriptor) -> Arc<Self> {
+        Arc::new(ExternalTexture {
+            state: ResourceState::Invalid,
+            planes: arrayvec::ArrayVec::new(),
+            label: desc.label.to_string(),
+            tracking_data: TrackingData::new(device.tracker_indices.external_textures.clone()),
+            device,
+        })
     }
 }
 
@@ -2462,10 +3284,8 @@ pub(crate) struct QuerySetState {
 pub struct QuerySet {
     pub(crate) state: ResourceState<QuerySetState>,
     pub(crate) device: Arc<Device>,
-    /// The `label` from the descriptor used to create the resource.
-    pub(crate) label: String,
     pub(crate) tracking_data: TrackingData,
-    pub(crate) desc: wgt::QuerySetDescriptor<()>,
+    pub(crate) desc: wgt::QuerySetDescriptor<String>,
     pub(crate) initialized_slots: Mutex<bit_vec::BitVec>,
 }
 
@@ -2492,12 +3312,11 @@ impl QuerySet {
     pub fn invalid(device: Arc<Device>, desc: &QuerySetDescriptor) -> Arc<Self> {
         Arc::new(QuerySet {
             state: ResourceState::Invalid,
-            label: desc.label.to_string(),
             tracking_data: TrackingData::new(device.tracker_indices.query_sets.clone()),
-            desc: desc.clone().map_label(|_| ()),
+            desc: desc.map_label(|l| l.to_string()),
             initialized_slots: Mutex::new(
                 rank::QUERY_SET_INITIALIZED_SLOTS,
-                bit_vec::BitVec::from_elem(desc.count as usize, false),
+                bit_vec::BitVec::new(),
             ),
             device,
         })
@@ -2550,10 +3369,17 @@ impl QuerySet {
             life_lock.schedule_resource_destruction(temp, last_submit_index);
         }
     }
+
+    pub fn descriptor(&self) -> &wgt::QuerySetDescriptor<String> {
+        &self.desc
+    }
 }
 
 impl Drop for QuerySet {
+    #[allow(trivial_casts)]
     fn drop(&mut self) {
+        profiling::scope!("QuerySet::drop");
+        api_log!("QuerySet::drop {:?}", self as *const _);
         resource_log!("Destroy raw {}", self.error_ident());
         #[cfg(feature = "trace")]
         if let Some(trace) = self.device.trace.lock().as_mut() {
@@ -2574,7 +3400,11 @@ impl Drop for QuerySet {
 }
 
 crate::impl_resource_type!(QuerySet);
-crate::impl_labeled!(QuerySet);
+impl Labeled for QuerySet {
+    fn label(&self) -> &str {
+        &self.desc.label
+    }
+}
 crate::impl_parent_device!(QuerySet);
 crate::impl_storage_item!(QuerySet);
 crate::impl_trackable!(QuerySet);
@@ -2647,8 +3477,13 @@ unsafe impl Send for BlasCompactState {}
 unsafe impl Sync for BlasCompactState {}
 
 #[derive(Debug)]
-pub struct Blas {
+pub(crate) struct BlasState {
     pub(crate) raw: Snatchable<Box<dyn hal::DynAccelerationStructure>>,
+}
+
+#[derive(Debug)]
+pub struct Blas {
+    pub(crate) state: ResourceState<BlasState>,
     pub(crate) device: Arc<Device>,
     pub(crate) size_info: hal::AccelerationStructureBuildSizes,
     pub(crate) sizes: wgt::BlasGeometrySizeDescriptors,
@@ -2664,12 +3499,22 @@ pub struct Blas {
 }
 
 impl Drop for Blas {
+    #[allow(trivial_casts)]
     fn drop(&mut self) {
+        profiling::scope!("Blas::drop");
+        api_log!("Blas::drop {:?}", self as *const _);
+        #[cfg(feature = "trace")]
+        if let Some(t) = self.device.trace.lock().as_mut() {
+            use crate::device::trace::{to_trace, Action};
+            t.add(Action::DropBlas(unsafe { to_trace(self) }));
+        }
         resource_log!("Destroy raw {}", self.error_ident());
         // SAFETY: We are in the Drop impl, and we don't use self.raw or self.compaction_buffer anymore after this point.
-        if let Some(raw) = self.raw.take() {
-            unsafe {
-                self.device.raw().destroy_acceleration_structure(raw);
+        if let ResourceState::Valid(state) = &mut self.state {
+            if let Some(raw) = state.raw.take() {
+                unsafe {
+                    self.device.raw().destroy_acceleration_structure(raw);
+                }
             }
         }
         if let Some(mut raw) = self.compaction_buffer.take() {
@@ -2686,17 +3531,88 @@ impl RawResourceAccess for Blas {
     type DynResource = dyn hal::DynAccelerationStructure;
 
     fn raw<'a>(&'a self, guard: &'a SnatchGuard) -> Option<&'a Self::DynResource> {
-        self.raw.get(guard).map(|it| it.as_ref())
+        self.state().ok()?.raw.get(guard).map(|it| it.as_ref())
     }
 }
 
 impl Blas {
-    pub(crate) fn prepare_compact_async(
+    pub(crate) fn state(&self) -> Result<&BlasState, InvalidResourceError> {
+        match &self.state {
+            ResourceState::Valid(state) => Ok(state),
+            ResourceState::Invalid => Err(InvalidResourceError(self.error_ident())),
+        }
+    }
+
+    pub(crate) fn check_is_valid(&self) -> Result<(), InvalidResourceError> {
+        self.state().map(|_| ())
+    }
+
+    pub(crate) fn invalid(device: Arc<Device>, desc: &BlasDescriptor) -> Arc<Self> {
+        Arc::new(Blas {
+            state: ResourceState::Invalid,
+            size_info: hal::AccelerationStructureBuildSizes {
+                acceleration_structure_size: 0,
+                update_scratch_size: 0,
+                build_scratch_size: 0,
+            },
+            sizes: wgt::BlasGeometrySizeDescriptors::Triangles {
+                descriptors: Vec::new(),
+            },
+            flags: desc.flags,
+            update_mode: desc.update_mode,
+            built_index: RwLock::new(rank::BLAS_BUILT_INDEX, None),
+            handle: 0,
+            label: desc.label.to_string(),
+            tracking_data: TrackingData::new(device.tracker_indices.blas_s.clone()),
+            device,
+            compaction_buffer: None,
+            compacted_state: Mutex::new(rank::BLAS_COMPACTION_STATE, BlasCompactState::Idle),
+        })
+    }
+
+    pub fn handle(&self) -> Option<u64> {
+        Some(self.handle)
+    }
+
+    pub fn ready_for_compaction(self: &Arc<Self>) -> Result<bool, InvalidResourceError> {
+        profiling::scope!("Blas::prepare_compact_async");
+        api_log!("Blas::prepare_compact_async {:?}", Arc::as_ptr(self));
+
+        self.check_is_valid()?;
+        let state = self.compacted_state.lock();
+        Ok(matches!(*state, BlasCompactState::Ready { .. }))
+    }
+
+    pub fn prepare_compact_async(
+        self: &Arc<Self>,
+        callback: Option<BlasCompactCallback>,
+    ) -> Result<SubmissionIndex, BlasPrepareCompactError> {
+        profiling::scope!("Blas::prepare_compact_async");
+        api_log!("Blas::prepare_compact_async {:?}", Arc::as_ptr(self));
+
+        let compact_result = self.prepare_compact_async_inner(callback);
+
+        match compact_result {
+            Ok(submission_index) => Ok(submission_index),
+            Err((mut callback, err)) => {
+                if let Some(callback) = callback.take() {
+                    callback(Err(err.clone()));
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn prepare_compact_async_inner(
         self: &Arc<Self>,
         op: Option<BlasCompactCallback>,
     ) -> Result<SubmissionIndex, (Option<BlasCompactCallback>, BlasPrepareCompactError)> {
         let device = &self.device;
         if let Err(e) = device.check_is_valid() {
+            return Err((op, e.into()));
+        }
+
+        if let Err(e) = self.check_is_valid() {
             return Err((op, e.into()));
         }
 
@@ -2729,10 +3645,11 @@ impl Blas {
         };
 
         let submit_index = if let Some(queue) = device.get_queue() {
+            drop(state);
             queue.lock_life().prepare_compact(self).unwrap_or(0) // '0' means no wait is necessary
         } else {
             // We can safely unwrap below since we just set the `compacted_state` to `BlasCompactState::Waiting`.
-            let (mut callback, status) = self.read_back_compact_size().unwrap();
+            let (mut callback, status) = self.read_back_compact_size(state).unwrap();
             if let Some(callback) = callback.take() {
                 callback(status);
             }
@@ -2744,8 +3661,10 @@ impl Blas {
 
     /// This function returns [`None`] only if [`Self::compacted_state`] is not [`BlasCompactState::Waiting`].
     #[must_use]
-    pub(crate) fn read_back_compact_size(&self) -> Option<BlasCompactReadyPendingClosure> {
-        let mut state = self.compacted_state.lock();
+    pub(crate) fn read_back_compact_size(
+        &self,
+        mut state: MutexGuard<'_, BlasCompactState>,
+    ) -> Option<BlasCompactReadyPendingClosure> {
         let pending_compact = match mem::replace(&mut *state, BlasCompactState::Idle) {
             BlasCompactState::Waiting(pending_mapping) => pending_mapping,
             // Compaction cancelled e.g. by rebuild
@@ -2796,8 +3715,14 @@ crate::impl_storage_item!(Blas);
 crate::impl_trackable!(Blas);
 
 #[derive(Debug)]
-pub struct Tlas {
+pub(crate) struct TlasState {
     pub(crate) raw: Snatchable<Box<dyn hal::DynAccelerationStructure>>,
+    pub(crate) instance_buffer: Box<dyn hal::DynBuffer>,
+}
+
+#[derive(Debug)]
+pub struct Tlas {
+    pub(crate) state: ResourceState<TlasState>,
     pub(crate) device: Arc<Device>,
     pub(crate) size_info: hal::AccelerationStructureBuildSizes,
     pub(crate) max_instance_count: u32,
@@ -2805,22 +3730,64 @@ pub struct Tlas {
     pub(crate) update_mode: wgt::AccelerationStructureUpdateMode,
     pub(crate) built_index: RwLock<Option<NonZeroU64>>,
     pub(crate) dependencies: RwLock<Vec<Arc<Blas>>>,
-    pub(crate) instance_buffer: ManuallyDrop<Box<dyn hal::DynBuffer>>,
     /// The `label` from the descriptor used to create the resource.
     pub(crate) label: String,
     pub(crate) tracking_data: TrackingData,
 }
 
 impl Drop for Tlas {
+    #[allow(trivial_casts)]
     fn drop(&mut self) {
-        unsafe {
-            resource_log!("Destroy raw {}", self.error_ident());
-            if let Some(structure) = self.raw.take() {
-                self.device.raw().destroy_acceleration_structure(structure);
-            }
-            let buffer = ManuallyDrop::take(&mut self.instance_buffer);
-            self.device.raw().destroy_buffer(buffer);
+        profiling::scope!("Tlas::drop");
+        api_log!("Tlas::drop {:?}", self as *const _);
+
+        #[cfg(feature = "trace")]
+        if let Some(t) = self.device.trace.lock().as_mut() {
+            use crate::device::trace::{to_trace, Action};
+            t.add(Action::DropTlas(unsafe { to_trace(self) }));
         }
+
+        resource_log!("Destroy raw {}", self.error_ident());
+        let ResourceState::Valid(mut state) = mem::replace(&mut self.state, ResourceState::Invalid)
+        else {
+            return;
+        };
+        if let Some(structure) = state.raw.take() {
+            unsafe { self.device.raw().destroy_acceleration_structure(structure) };
+        }
+        unsafe { self.device.raw().destroy_buffer(state.instance_buffer) };
+    }
+}
+
+impl Tlas {
+    pub(crate) fn state(&self) -> Result<&TlasState, InvalidResourceError> {
+        match &self.state {
+            ResourceState::Valid(state) => Ok(state),
+            ResourceState::Invalid => Err(InvalidResourceError(self.error_ident())),
+        }
+    }
+
+    pub(crate) fn check_is_valid(&self) -> Result<(), InvalidResourceError> {
+        self.state().map(|_| ())
+    }
+
+    pub(crate) fn invalid(device: Arc<Device>, desc: &TlasDescriptor) -> Arc<Self> {
+        Arc::new(Self {
+            state: ResourceState::Invalid,
+            label: desc.label.to_string(),
+            tracking_data: TrackingData::new(device.tracker_indices.tlas_s.clone()),
+            size_info: hal::AccelerationStructureBuildSizes {
+                acceleration_structure_size: 0,
+                update_scratch_size: 0,
+                build_scratch_size: 0,
+            },
+            max_instance_count: desc.max_instances,
+            flags: desc.flags,
+            update_mode: desc.update_mode,
+            built_index: RwLock::new(rank::TLAS_BUILT_INDEX, None),
+            dependencies: RwLock::new(rank::TLAS_DEPENDENCIES, Vec::new()),
+            device,
+        })
     }
 }
 
@@ -2828,7 +3795,7 @@ impl RawResourceAccess for Tlas {
     type DynResource = dyn hal::DynAccelerationStructure;
 
     fn raw<'a>(&'a self, guard: &'a SnatchGuard) -> Option<&'a Self::DynResource> {
-        self.raw.get(guard).map(|raw| raw.as_ref())
+        self.state().ok()?.raw.get(guard).map(|raw| raw.as_ref())
     }
 }
 

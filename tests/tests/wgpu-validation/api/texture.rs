@@ -1,6 +1,8 @@
 //! Tests of [`wgpu::Texture`] and related.
 
-use wgpu_test::{fail, valid};
+use std::sync::Arc;
+
+use wgpu_test::{fail, fail_if, valid};
 
 /// Ensures that submitting a command buffer referencing an already destroyed texture
 /// results in an error.
@@ -581,6 +583,79 @@ fn copy_buffer_to_texture_forbidden_format_aspect() {
     }
 }
 
+/// Ensures that `bytes_per_row` of buffer-texture copies must be a multiple of 256, or only
+/// of the texel block copy size with [`wgpu::Features::UNRESTRICTED_BYTES_PER_ROW`].
+#[test]
+fn copy_bytes_per_row_alignment() {
+    for (features, format, should_fail) in [
+        (wgpu::Features::empty(), wgpu::TextureFormat::R8Unorm, true),
+        (
+            wgpu::Features::UNRESTRICTED_BYTES_PER_ROW,
+            wgpu::TextureFormat::R8Unorm,
+            false,
+        ),
+        (
+            wgpu::Features::UNRESTRICTED_BYTES_PER_ROW,
+            wgpu::TextureFormat::Rg8Unorm,
+            true,
+        ),
+    ] {
+        let (device, _queue) = wgpu::Device::noop(&wgpu::DeviceDescriptor {
+            required_features: features,
+            ..Default::default()
+        });
+        let size = wgpu::Extent3d {
+            width: 2,
+            height: 2,
+            depth_or_array_layers: 1,
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let buffer_copy = wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(101),
+                rows_per_image: None,
+            },
+        };
+
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_buffer_to_texture(buffer_copy, texture.as_image_copy(), size);
+        fail_if(
+            &device,
+            should_fail,
+            || encoder.finish(),
+            Some("is not a multiple of"),
+        );
+
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_texture_to_buffer(texture.as_image_copy(), buffer_copy, size);
+        fail_if(
+            &device,
+            should_fail,
+            || encoder.finish(),
+            Some("is not a multiple of"),
+        );
+    }
+}
+
 /// Ensures that attempting to create a texture with [`wgpu::TextureUsages::TRANSIENT_ATTACHMENT`]
 /// and its unsupported usages fails validation.
 #[test]
@@ -686,4 +761,31 @@ fn transient_invalid_storeop() {
         },
       Some("Color attachment with `TRANSIENT_ATTACHMENT` usage can only be used with `LoadOp::Clear` or `LoadOp::DontCare` (if it is available) and  `StoreOp::Discard`. Operations `(Clear(Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }), Store)` were provided")
     );
+}
+
+/// <https://bugzilla.mozilla.org/show_bug.cgi?id=2053860>
+#[test]
+fn no_overflow_in_texture_selector() {
+    let (device, _queue) = wgpu::Device::noop(&wgpu::DeviceDescriptor::default());
+    // ignore validation errors to not panic before reaching `TextureView::invalid`
+    device.on_uncaptured_error(Arc::new(|_| {}));
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width: 59,
+            height: 401,
+            depth_or_array_layers: 1948,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let _view = texture.create_view(&wgpu::TextureViewDescriptor {
+        base_array_layer: 3385121660,
+        array_layer_count: Some(3815184380),
+        ..Default::default()
+    });
 }

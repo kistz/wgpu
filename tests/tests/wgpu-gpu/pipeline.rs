@@ -1,4 +1,4 @@
-use wgpu_test::{fail, gpu_test, GpuTestConfiguration, GpuTestInitializer, TestParameters};
+use wgpu_test::{apply, fail, gpu_test, GpuTestConfiguration, GpuTestInitializer, TestParameters};
 
 pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
     vec.extend([
@@ -7,6 +7,7 @@ pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
         RENDER_PIPELINE_DEFAULT_LAYOUT_BAD_MODULE,
         RENDER_PIPELINE_DEFAULT_LAYOUT_BAD_BGL_INDEX,
         NO_TARGETLESS_RENDER,
+        DEPTH_BIAS_CLAMP,
     ]);
 }
 
@@ -39,7 +40,7 @@ const TRIVIAL_FRAGMENT_SHADER_DESC: wgpu::ShaderModuleDescriptor = wgpu::ShaderM
 // Create an invalid shader and a compute pipeline that uses it
 // with a default bindgroup layout, and then ask for that layout.
 // Validation should fail, but wgpu should not panic.
-#[gpu_test]
+#[apply(gpu_test!)]
 static COMPUTE_PIPELINE_DEFAULT_LAYOUT_BAD_MODULE: GpuTestConfiguration =
     GpuTestConfiguration::new()
         .parameters(TestParameters::default().enable_noop())
@@ -67,7 +68,7 @@ static COMPUTE_PIPELINE_DEFAULT_LAYOUT_BAD_MODULE: GpuTestConfiguration =
             );
         });
 
-#[gpu_test]
+#[apply(gpu_test!)]
 static COMPUTE_PIPELINE_DEFAULT_LAYOUT_BAD_BGL_INDEX: GpuTestConfiguration =
     GpuTestConfiguration::new()
         .parameters(
@@ -98,7 +99,7 @@ static COMPUTE_PIPELINE_DEFAULT_LAYOUT_BAD_BGL_INDEX: GpuTestConfiguration =
             );
         });
 
-#[gpu_test]
+#[apply(gpu_test!)]
 static RENDER_PIPELINE_DEFAULT_LAYOUT_BAD_MODULE: GpuTestConfiguration =
     GpuTestConfiguration::new()
         .parameters(TestParameters::default().enable_noop())
@@ -133,7 +134,7 @@ static RENDER_PIPELINE_DEFAULT_LAYOUT_BAD_MODULE: GpuTestConfiguration =
             );
         });
 
-#[gpu_test]
+#[apply(gpu_test!)]
 static RENDER_PIPELINE_DEFAULT_LAYOUT_BAD_BGL_INDEX: GpuTestConfiguration =
     GpuTestConfiguration::new()
         .parameters(
@@ -184,7 +185,7 @@ static RENDER_PIPELINE_DEFAULT_LAYOUT_BAD_BGL_INDEX: GpuTestConfiguration =
             );
         });
 
-#[gpu_test]
+#[apply(gpu_test!)]
 static NO_TARGETLESS_RENDER: GpuTestConfiguration = GpuTestConfiguration::new()
     .parameters(TestParameters::default().enable_noop())
     .run_sync(|ctx| {
@@ -225,4 +226,39 @@ static NO_TARGETLESS_RENDER: GpuTestConfiguration = GpuTestConfiguration::new()
                 "but no render target for the pipeline was specified."
             )),
         )
+    });
+
+// A non-zero depth bias clamp needs Vulkan's `depthBiasClamp` feature enabled on the device.
+#[apply(gpu_test!)]
+static DEPTH_BIAS_CLAMP: GpuTestConfiguration = GpuTestConfiguration::new()
+    .parameters(TestParameters::default().downlevel_flags(wgpu::DownlevelFlags::DEPTH_BIAS_CLAMP))
+    .run_sync(|ctx| {
+        let _ = ctx
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: None,
+                layout: None,
+                vertex: wgpu::VertexState {
+                    module: &ctx.device.create_shader_module(TRIVIAL_VERTEX_SHADER_DESC),
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: Default::default(),
+                    bias: wgpu::DepthBiasState {
+                        constant: 1,
+                        slope_scale: 1.0,
+                        clamp: 0.01,
+                    },
+                }),
+                multisample: Default::default(),
+                fragment: None,
+                multiview_mask: None,
+                cache: None,
+            });
     });

@@ -25,8 +25,6 @@ use crate::*;
 #[derive(Debug, Clone)]
 pub struct QuerySet {
     pub(crate) inner: dispatch::DispatchQuerySet,
-    pub(crate) ty: QueryType,
-    pub(crate) count: u32,
 }
 #[cfg(send_sync)]
 #[cfg(send_sync)]
@@ -48,12 +46,31 @@ impl QuerySet {
 
     /// Returns the type of queries stored.
     pub fn ty(&self) -> QueryType {
-        self.ty
+        self.inner.ty()
     }
 
     /// Returns the number of query result slots.
     pub fn count(&self) -> u32 {
-        self.count
+        self.inner.count()
+    }
+}
+
+#[cfg(wgpu_core)]
+impl QuerySet {
+    /// Create a new query set of wgpu from a wgpu-core query set.
+    ///
+    /// # Arguments
+    ///
+    /// - `core_query_set` - wgpu-core query set.
+    pub fn from_core(core_query_set: alloc::sync::Arc<wgc::resource::QuerySet>) -> Self {
+        Self {
+            inner: crate::backend::wgpu_core::CoreQuerySet::from_core(core_query_set).into(),
+        }
+    }
+
+    /// Returns the underlying wgpu-core query set if this `QuerySet` is on the wgpu-core backend, otherwise `None`.
+    pub fn as_core(&self) -> Option<alloc::sync::Arc<wgc::resource::QuerySet>> {
+        self.inner.as_core_opt().map(|qs| qs.as_core())
     }
 }
 
