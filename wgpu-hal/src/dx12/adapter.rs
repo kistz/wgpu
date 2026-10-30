@@ -706,6 +706,23 @@ impl super::Adapter {
             wgt::Features::EXPERIMENTAL_MESH_SHADER,
             mesh_shader_supported,
         );
+        let work_graphs_supported = {
+            let mut features21 = Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS21::default();
+            unsafe {
+                device.CheckFeatureSupport(
+                    Direct3D12::D3D12_FEATURE_D3D12_OPTIONS21,
+                    <*mut _>::cast(&mut features21),
+                    size_of_val(&features21) as u32,
+                )
+            }
+            .is_ok()
+                && features21.WorkGraphsTier.0 >= Direct3D12::D3D12_WORK_GRAPHS_TIER_1_0.0
+                && shader_model >= naga::back::hlsl::ShaderModel::V6_8
+        };
+        features.set(
+            wgt::Features::EXPERIMENTAL_WORK_GRAPHS,
+            work_graphs_supported,
+        );
         let shader_barycentrics_supported = {
             let mut features3 = Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
             unsafe {

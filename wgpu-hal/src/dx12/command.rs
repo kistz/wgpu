@@ -519,15 +519,6 @@ impl super::CommandEncoder {
 
         (t, buffer)
     }
-    pub unsafe fn draw_graph(&mut self) {
-        self.prepare_dispatch([group_count_x, group_count_y, group_count_z]);
-        let cmd_list10: Direct3D12::ID3D12GraphicsCommandList10 =
-            self.list.as_ref().unwrap().cast().unwrap();
-
-        unsafe {
-            cmd_list10.DispatchGraph(group_count_x, group_count_y, group_count_z);
-        }
-    }
 }
 
 impl crate::CommandEncoder for super::CommandEncoder {
@@ -623,6 +614,10 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 self.temp.barriers.push(raw);
             } else if barrier.usage.from == wgt::BufferUses::STORAGE_READ_WRITE
                 || barrier.usage.from == wgt::BufferUses::ACCELERATION_STRUCTURE_QUERY
+                // Consecutive dispatches of a work graph may overlap. `dispatch_graph`
+                // places a barrier before initializing the backing memory.
+                || (barrier.usage.from == wgt::BufferUses::WORK_GRAPH_BACKING_MEMORY
+                    && barrier.usage.to != wgt::BufferUses::WORK_GRAPH_BACKING_MEMORY)
             {
                 let raw = Direct3D12::D3D12_RESOURCE_BARRIER {
                     Type: Direct3D12::D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -1743,6 +1738,8 @@ impl crate::CommandEncoder for super::CommandEncoder {
             self.reset_signature(&pipeline.layout);
         };
 
+        self.pass.work_graph = None;
+        self.pass.bound_work_graph = None;
         unsafe { list.SetPipelineState(&pipeline.raw) }
     }
 
@@ -1787,6 +1784,123 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 0,
             )
         }
+    }
+
+    unsafe fn set_work_graph_pipeline(&mut self, pipeline: &super::WorkGraphPipeline) {
+        let list = self.list.clone().unwrap();
+
+        if self.pass.layout.signature != pipeline.layout.signature {
+            // D3D12 requires full reset on signature change
+            unsafe { list.SetComputeRootSignature(pipeline.layout.signature.as_ref()) };
+            self.reset_signature(&pipeline.layout);
+        };
+
+        self.pass.work_graph = Some(pipeline.program_identifier);
+    }
+
+    unsafe fn dispatch_graph(&mut self, desc: &crate::DispatchGraphDescriptor<super::Buffer>) {
+        if desc.inputs.is_empty() {
+            return;
+        }
+
+        self.prepare_dispatch([0; 3]);
+
+        let list = self.list.as_ref().unwrap();
+        let list10: Direct3D12::ID3D12GraphicsCommandList10 = list.cast().unwrap();
+
+        let program_identifier = self.pass.work_graph.unwrap();
+        let backing_memory = Direct3D12::D3D12_GPU_VIRTUAL_ADDRESS_RANGE {
+            StartAddress: unsafe { desc.backing_memory.buffer.resource.GetGPUVirtualAddress() }
+                + desc.backing_memory.offset,
+            SizeInBytes: desc.backing_memory.size,
+        };
+        let program = (program_identifier, backing_memory);
+
+        if desc.initialize || self.pass.bound_work_graph != Some(program) {
+            let flags = if desc.initialize {
+                let barrier = Direct3D12::D3D12_RESOURCE_BARRIER {
+                    Type: Direct3D12::D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Flags: Direct3D12::D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: Direct3D12::D3D12_RESOURCE_BARRIER_0 {
+                        UAV: mem::ManuallyDrop::new(Direct3D12::D3D12_RESOURCE_UAV_BARRIER {
+                            pResource: unsafe {
+                                borrow_interface_temporarily(&desc.backing_memory.buffer.resource)
+                            },
+                        }),
+                    },
+                };
+                unsafe { list.ResourceBarrier(&[barrier]) };
+                Direct3D12::D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE
+            } else {
+                Direct3D12::D3D12_SET_WORK_GRAPH_FLAG_NONE
+            };
+
+            unsafe {
+                list10.SetProgram(&Direct3D12::D3D12_SET_PROGRAM_DESC {
+                    Type: Direct3D12::D3D12_PROGRAM_TYPE_WORK_GRAPH,
+                    Anonymous: Direct3D12::D3D12_SET_PROGRAM_DESC_0 {
+                        WorkGraph: Direct3D12::D3D12_SET_WORK_GRAPH_DESC {
+                            ProgramIdentifier: program_identifier,
+                            Flags: flags,
+                            BackingMemory: backing_memory,
+                            NodeLocalRootArgumentsTable: Default::default(),
+                        },
+                    },
+                })
+            };
+            self.pass.bound_work_graph = Some(program);
+        }
+
+        // Records must be aligned to their largest scalar member, which is at most 8 bytes.
+        let records = desc
+            .inputs
+            .iter()
+            .map(|input| {
+                let mut aligned = alloc::vec![0u64; input.records.len().div_ceil(8)];
+                bytemuck::cast_slice_mut::<u64, u8>(&mut aligned)[..input.records.len()]
+                    .copy_from_slice(input.records);
+                aligned
+            })
+            .collect::<Vec<_>>();
+        let node_inputs = desc
+            .inputs
+            .iter()
+            .zip(&records)
+            .map(|(input, records)| Direct3D12::D3D12_NODE_CPU_INPUT {
+                EntrypointIndex: input.entrypoint_index,
+                NumRecords: input.num_records,
+                pRecords: if records.is_empty() {
+                    core::ptr::null()
+                } else {
+                    records.as_ptr().cast()
+                },
+                RecordStrideInBytes: input.record_stride,
+            })
+            .collect::<Vec<_>>();
+
+        let dispatch_desc = if let [node_input] = node_inputs.as_slice() {
+            Direct3D12::D3D12_DISPATCH_GRAPH_DESC {
+                Mode: Direct3D12::D3D12_DISPATCH_MODE_NODE_CPU_INPUT,
+                Anonymous: Direct3D12::D3D12_DISPATCH_GRAPH_DESC_0 {
+                    NodeCPUInput: *node_input,
+                },
+            }
+        } else {
+            Direct3D12::D3D12_DISPATCH_GRAPH_DESC {
+                Mode: Direct3D12::D3D12_DISPATCH_MODE_MULTI_NODE_CPU_INPUT,
+                Anonymous: Direct3D12::D3D12_DISPATCH_GRAPH_DESC_0 {
+                    MultiNodeCPUInput: Direct3D12::D3D12_MULTI_NODE_CPU_INPUT {
+                        NumNodeInputs: node_inputs.len() as u32,
+                        pNodeInputs: node_inputs.as_ptr(),
+                        NodeInputStrideInBytes: size_of::<Direct3D12::D3D12_NODE_CPU_INPUT>()
+                            as u64,
+                    },
+                },
+            }
+        };
+
+        // The runtime copies the inputs and records into the command list.
+        unsafe { list10.DispatchGraph(&dispatch_desc) };
     }
 
     unsafe fn build_acceleration_structures<'a, T>(

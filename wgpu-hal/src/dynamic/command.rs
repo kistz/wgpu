@@ -4,9 +4,10 @@ use core::ops::Range;
 use crate::{
     AccelerationStructureBarrier, Api, Attachment, BufferBarrier, BufferBinding, BufferCopy,
     BufferTextureCopy, BuildAccelerationStructureDescriptor, ColorAttachment, CommandEncoder,
-    ComputePassDescriptor, DepthStencilAttachment, DeviceError, DynRayTracingPipeline, Label,
-    MemoryRange, PassTimestampWrites, RayTracingPassDescriptor, Rect, RenderPassDescriptor,
-    TextureBarrier, TextureCopy,
+    ComputePassDescriptor, DepthStencilAttachment, DeviceError, DispatchGraphDescriptor,
+    DynRayTracingPipeline, DynWorkGraphPipeline, Label, MemoryRange, PassTimestampWrites,
+    RayTracingPassDescriptor, Rect, RenderPassDescriptor, TextureBarrier, TextureCopy,
+    WorkGraphBackingMemory,
 };
 
 use super::{
@@ -190,6 +191,9 @@ pub trait DynCommandEncoder: DynResource + core::fmt::Debug {
         buffer: &dyn DynBuffer,
         offset: wgt::BufferAddress,
     );
+
+    unsafe fn set_work_graph_pipeline(&mut self, pipeline: &dyn DynWorkGraphPipeline);
+    unsafe fn dispatch_graph(&mut self, desc: &DispatchGraphDescriptor<dyn DynBuffer>);
 
     unsafe fn begin_ray_tracing_pass(&mut self, desc: &RayTracingPassDescriptor);
     unsafe fn end_ray_tracing_pass(&mut self);
@@ -636,6 +640,24 @@ impl<C: CommandEncoder + DynResource> DynCommandEncoder for C {
     ) {
         let buffer = buffer.expect_downcast_ref();
         unsafe { C::dispatch_workgroups_indirect(self, buffer, offset) };
+    }
+
+    unsafe fn set_work_graph_pipeline(&mut self, pipeline: &dyn DynWorkGraphPipeline) {
+        let pipeline = pipeline.expect_downcast_ref();
+        unsafe { C::set_work_graph_pipeline(self, pipeline) };
+    }
+
+    unsafe fn dispatch_graph(&mut self, desc: &DispatchGraphDescriptor<dyn DynBuffer>) {
+        let desc = DispatchGraphDescriptor {
+            backing_memory: WorkGraphBackingMemory {
+                buffer: desc.backing_memory.buffer.expect_downcast_ref(),
+                offset: desc.backing_memory.offset,
+                size: desc.backing_memory.size,
+            },
+            initialize: desc.initialize,
+            inputs: desc.inputs,
+        };
+        unsafe { C::dispatch_graph(self, &desc) };
     }
 
     unsafe fn set_render_pipeline(&mut self, pipeline: &dyn DynRenderPipeline) {

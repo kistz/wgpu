@@ -177,7 +177,7 @@ pub fn map_buffer_usage_to_state(usage: wgt::BufferUses) -> Direct3D12::D3D12_RE
     if usage.intersects(Bu::INDIRECT) {
         state |= Direct3D12::D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
     }
-    if usage.intersects(Bu::ACCELERATION_STRUCTURE_QUERY) {
+    if usage.intersects(Bu::ACCELERATION_STRUCTURE_QUERY | Bu::WORK_GRAPH_BACKING_MEMORY) {
         state |= Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     }
     state

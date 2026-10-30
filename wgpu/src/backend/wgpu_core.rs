@@ -561,6 +561,11 @@ impl CoreComputePipeline {
 }
 
 #[derive(Debug, Clone)]
+pub struct CoreWorkGraphPipeline {
+    pub(crate) wgpu_work_graph_pipeline: Arc<wgc::pipeline::WorkGraphPipeline>,
+}
+
+#[derive(Debug, Clone)]
 pub struct CoreRenderPipeline {
     pub(crate) wgpu_render_pipeline: Arc<wgc::pipeline::RenderPipeline>,
 }
@@ -707,6 +712,7 @@ crate::cmp::impl_eq_ord_hash_arc_address!(CoreQuerySet => .wgpu_query_set);
 crate::cmp::impl_eq_ord_hash_arc_address!(CorePipelineLayout => .wgpu_pipeline_layout);
 crate::cmp::impl_eq_ord_hash_arc_address!(CoreRenderPipeline => .wgpu_render_pipeline);
 crate::cmp::impl_eq_ord_hash_arc_address!(CoreComputePipeline => .wgpu_compute_pipeline);
+crate::cmp::impl_eq_ord_hash_arc_address!(CoreWorkGraphPipeline => .wgpu_work_graph_pipeline);
 crate::cmp::impl_eq_ord_hash_arc_address!(CorePipelineCache => .wgpu_pipeline_cache);
 crate::cmp::impl_eq_ord_hash_arc_address!(CoreCommandEncoder => .wgpu_command_encoder);
 crate::cmp::impl_eq_ord_hash_proxy!(CoreComputePass => .id);
@@ -1420,6 +1426,26 @@ impl dispatch::DeviceInterface for CoreDevice {
         .into()
     }
 
+    fn create_work_graph_pipeline(
+        &self,
+        desc: &crate::WorkGraphPipelineDescriptor<'_>,
+    ) -> dispatch::DispatchWorkGraphPipeline {
+        let descriptor = wgc::pipeline::WorkGraphPipelineDescriptor {
+            label: desc.label.map(Borrowed),
+            layout: desc.layout.inner.as_core().wgpu_pipeline_layout.clone(),
+            module: desc.module.inner.as_core().wgpu_shader_module.clone(),
+            program_name: Borrowed(desc.program_name),
+            entrypoints: Borrowed(desc.entrypoints),
+            include_all_available_nodes: desc.include_all_available_nodes,
+        };
+
+        let wgpu_work_graph_pipeline = self.wgpu_device.create_work_graph_pipeline(descriptor);
+        CoreWorkGraphPipeline {
+            wgpu_work_graph_pipeline,
+        }
+        .into()
+    }
+
     unsafe fn create_pipeline_cache(
         &self,
         desc: &crate::PipelineCacheDescriptor<'_>,
@@ -1985,6 +2011,16 @@ impl dispatch::ComputePipelineInterface for CoreComputePipeline {
     }
 }
 
+impl dispatch::WorkGraphPipelineInterface for CoreWorkGraphPipeline {
+    fn memory_requirements(&self) -> wgt::WorkGraphMemoryRequirements {
+        self.wgpu_work_graph_pipeline.memory_requirements()
+    }
+
+    fn entrypoints(&self) -> &[wgt::WorkGraphEntrypoint] {
+        self.wgpu_work_graph_pipeline.entrypoints()
+    }
+}
+
 impl dispatch::PipelineCacheInterface for CorePipelineCache {
     fn get_data(&self) -> Option<Vec<u8>> {
         self.wgpu_pipeline_cache.get_data()
@@ -2388,6 +2424,28 @@ impl dispatch::ComputePassInterface for CoreComputePass {
 
         self.pass
             .dispatch_workgroups_indirect(indirect_buffer.wgpu_buffer.clone(), indirect_offset);
+    }
+
+    fn set_work_graph_pipeline(
+        &mut self,
+        pipeline: &dispatch::DispatchWorkGraphPipeline,
+        backing_memory: &dispatch::DispatchBuffer,
+        offset: crate::BufferAddress,
+        size: crate::BufferAddress,
+    ) {
+        let pipeline = pipeline.as_core();
+        let backing_memory = backing_memory.as_core();
+
+        self.pass.set_work_graph_pipeline(
+            pipeline.wgpu_work_graph_pipeline.clone(),
+            backing_memory.wgpu_buffer.clone(),
+            offset,
+            Some(size),
+        );
+    }
+
+    unsafe fn dispatch_graph(&mut self, inputs: &[wgt::WorkGraphNodeInput<&[u8]>]) {
+        unsafe { self.pass.dispatch_graph(inputs) };
     }
 
     fn transition_resources<'a>(

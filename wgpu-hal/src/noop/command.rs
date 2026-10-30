@@ -301,6 +301,10 @@ impl crate::CommandEncoder for CommandBuffer {
     ) {
     }
 
+    unsafe fn set_work_graph_pipeline(&mut self, _pipeline: &Resource) {}
+
+    unsafe fn dispatch_graph(&mut self, _desc: &crate::DispatchGraphDescriptor<Buffer>) {}
+
     unsafe fn begin_ray_tracing_pass(&mut self, _desc: &crate::RayTracingPassDescriptor) {}
 
     unsafe fn end_ray_tracing_pass(&mut self) {}

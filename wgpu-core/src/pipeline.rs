@@ -482,6 +482,10 @@ pub enum CreatePipelineError {
     InvalidResource(#[from] InvalidResourceError),
     #[error(transparent)]
     Render(#[from] RenderError),
+    #[error("Work graph pipelines require a passthrough shader module")]
+    WorkGraphRequiresPassthroughModule,
+    #[error("Work graph creation failed: {0}")]
+    WorkGraph(String),
 }
 
 impl From<ColorAttachmentError> for CreatePipelineError {
@@ -520,6 +524,7 @@ impl CreatePipelineError {
             hal::PipelineError::PipelineConstants(stage, message) => {
                 CreatePipelineError::PipelineConstants { stage, message }
             }
+            hal::PipelineError::WorkGraph(message) => CreatePipelineError::WorkGraph(message),
         }
     }
 }
@@ -579,6 +584,7 @@ impl WebGpuError for CreatePipelineError {
             Self::Internal { .. } => ErrorType::Internal,
             Self::PipelineConstants { .. } => ErrorType::Validation,
             Self::Render(e) => e.webgpu_error_type(),
+            Self::WorkGraphRequiresPassthroughModule | Self::WorkGraph(_) => ErrorType::Validation,
         }
     }
 }
@@ -692,6 +698,120 @@ impl ComputePipeline {
             });
         };
         bgl
+    }
+}
+
+/// Describes a work graph pipeline.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+/// cbindgen:ignore
+pub struct WorkGraphPipelineDescriptor<'a, PLL = Arc<PipelineLayout>, SM = Arc<ShaderModule>> {
+    pub label: Label<'a>,
+    /// The layout of bind groups for this pipeline.
+    pub layout: PLL,
+    /// A passthrough shader module containing a DXIL or HLSL shader library.
+    pub module: SM,
+    /// Name of the work graph program.
+    pub program_name: Cow<'a, str>,
+    /// Nodes that are entrypoints in addition to the ones declared in the shaders.
+    pub entrypoints: Cow<'a, [wgt::WorkGraphNodeId<'a>]>,
+    /// Add all nodes in the shader library to the work graph.
+    pub include_all_available_nodes: bool,
+}
+
+#[derive(Debug)]
+pub struct WorkGraphPipelineState {
+    pub(crate) raw: ManuallyDrop<Box<dyn hal::DynWorkGraphPipeline>>,
+    pub(crate) layout: Arc<PipelineLayout>,
+    pub(crate) _shader_module: Arc<ShaderModule>,
+}
+
+#[derive(Debug)]
+pub struct WorkGraphPipeline {
+    pub(crate) state: ResourceState<WorkGraphPipelineState>,
+    pub(crate) device: Arc<Device>,
+    pub(crate) late_sized_buffer_groups: ArrayVec<LateSizedBufferGroup, { hal::MAX_BIND_GROUPS }>,
+    pub(crate) memory_requirements: wgt::WorkGraphMemoryRequirements,
+    pub(crate) entrypoints: Vec<wgt::WorkGraphEntrypoint>,
+    /// The `label` from the descriptor used to create the resource.
+    pub(crate) label: String,
+    pub(crate) tracking_data: TrackingData,
+}
+
+impl Drop for WorkGraphPipeline {
+    #[allow(trivial_casts)]
+    fn drop(&mut self) {
+        profiling::scope!("WorkGraphPipeline::drop");
+        api_log!("WorkGraphPipeline::drop {:?}", self as *const _);
+        resource_log!("Destroy raw {}", self.error_ident());
+        #[cfg(feature = "trace")]
+        {
+            use crate::device::trace;
+            if let Some(t) = self.device.trace.lock().as_mut() {
+                t.add(trace::Action::DropWorkGraphPipeline(unsafe {
+                    trace::to_trace(self)
+                }));
+            }
+        }
+        let ResourceState::Valid(state) = &mut self.state else {
+            return;
+        };
+        // SAFETY: We are in the Drop impl and we don't use self.raw anymore after this point.
+        let raw = unsafe { ManuallyDrop::take(&mut state.raw) };
+        unsafe {
+            self.device.raw().destroy_work_graph_pipeline(raw);
+        }
+    }
+}
+
+crate::impl_resource_type!(WorkGraphPipeline);
+crate::impl_labeled!(WorkGraphPipeline);
+crate::impl_parent_device!(WorkGraphPipeline);
+crate::impl_storage_item!(WorkGraphPipeline);
+crate::impl_trackable!(WorkGraphPipeline);
+
+impl WorkGraphPipeline {
+    pub(crate) fn raw(&self) -> Result<&dyn hal::DynWorkGraphPipeline, InvalidResourceError> {
+        let ResourceState::Valid(state) = &self.state else {
+            return Err(InvalidResourceError(self.error_ident()));
+        };
+        Ok(state.raw.as_ref())
+    }
+
+    pub(crate) fn layout(&self) -> Result<&Arc<PipelineLayout>, InvalidResourceError> {
+        let ResourceState::Valid(state) = &self.state else {
+            return Err(InvalidResourceError(self.error_ident()));
+        };
+        Ok(&state.layout)
+    }
+
+    pub(crate) fn check_valid(&self) -> Result<(), InvalidResourceError> {
+        let ResourceState::Valid(_) = &self.state else {
+            return Err(InvalidResourceError(self.error_ident()));
+        };
+        Ok(())
+    }
+
+    pub(crate) fn invalid(device: Arc<Device>, label: String) -> Arc<Self> {
+        Arc::new(Self {
+            tracking_data: TrackingData::new(device.tracker_indices.work_graph_pipelines.clone()),
+            state: ResourceState::Invalid,
+            device,
+            late_sized_buffer_groups: ArrayVec::new(),
+            memory_requirements: wgt::WorkGraphMemoryRequirements::default(),
+            entrypoints: Vec::new(),
+            label,
+        })
+    }
+
+    /// Size requirements for the backing memory of this work graph.
+    pub fn memory_requirements(&self) -> wgt::WorkGraphMemoryRequirements {
+        self.memory_requirements
+    }
+
+    /// The entrypoints of this work graph, in entrypoint index order.
+    pub fn entrypoints(&self) -> &[wgt::WorkGraphEntrypoint] {
+        &self.entrypoints
     }
 }
 

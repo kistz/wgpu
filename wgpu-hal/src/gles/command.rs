@@ -1318,6 +1318,14 @@ impl crate::CommandEncoder for super::CommandEncoder {
         unimplemented!()
     }
 
+    unsafe fn set_work_graph_pipeline(&mut self, _pipeline: &super::WorkGraphPipeline) {
+        unimplemented!()
+    }
+
+    unsafe fn dispatch_graph(&mut self, _desc: &crate::DispatchGraphDescriptor<super::Buffer>) {
+        unimplemented!()
+    }
+
     unsafe fn begin_ray_tracing_pass(&mut self, _desc: &crate::RayTracingPassDescriptor) {
         unimplemented!()
     }

@@ -51,6 +51,7 @@ ids! {
     pub type ShaderModule;
     pub type RenderPipeline;
     pub type ComputePipeline;
+    pub type WorkGraphPipeline;
     pub type PipelineCache;
     pub type CommandEncoder;
     pub type CommandBuffer;

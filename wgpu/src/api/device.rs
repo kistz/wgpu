@@ -285,6 +285,18 @@ impl Device {
         ComputePipeline { inner: pipeline }
     }
 
+    /// Creates a [`WorkGraphPipeline`].
+    ///
+    /// Requires [`Features::EXPERIMENTAL_WORK_GRAPHS`].
+    #[must_use]
+    pub fn create_work_graph_pipeline(
+        &self,
+        desc: &WorkGraphPipelineDescriptor<'_>,
+    ) -> WorkGraphPipeline {
+        let pipeline = self.inner.create_work_graph_pipeline(desc);
+        WorkGraphPipeline { inner: pipeline }
+    }
+
     /// Creates a [`Buffer`].
     #[must_use]
     pub fn create_buffer(&self, desc: &BufferDescriptor<'_>) -> Buffer {

@@ -197,6 +197,11 @@ pub enum Action<'a, R: ReferenceType> {
         desc: TraceComputePipelineDescriptor<'a>,
     },
     DropComputePipeline(PointerId<markers::ComputePipeline>),
+    CreateWorkGraphPipeline {
+        id: PointerId<markers::WorkGraphPipeline>,
+        desc: TraceWorkGraphPipelineDescriptor<'a>,
+    },
+    DropWorkGraphPipeline(PointerId<markers::WorkGraphPipeline>),
     CreateGeneralRenderPipeline {
         id: PointerId<markers::RenderPipeline>,
         desc: TraceGeneralRenderPipelineDescriptor<'a>,
@@ -285,4 +290,14 @@ pub type TraceComputePipelineDescriptor<'a> = crate::pipeline::ComputePipelineDe
     PointerId<markers::PipelineLayout>,
     PointerId<markers::ShaderModule>,
     PointerId<markers::PipelineCache>,
+>;
+
+/// Not a public API. For use by `player` only.
+///
+/// cbindgen:ignore
+#[doc(hidden)]
+pub type TraceWorkGraphPipelineDescriptor<'a> = crate::pipeline::WorkGraphPipelineDescriptor<
+    'a,
+    PointerId<markers::PipelineLayout>,
+    PointerId<markers::ShaderModule>,
 >;

@@ -121,7 +121,7 @@ bitflags::bitflags! {
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     #[cfg_attr(feature = "serde", serde(transparent))]
     #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-    pub struct BufferUses: u16 {
+    pub struct BufferUses: u32 {
         /// The argument to a read-only mapping.
         const MAP_READ = 1 << 0;
         /// The argument to a write-only mapping.
@@ -158,12 +158,14 @@ bitflags::bitflags! {
         const ACCELERATION_STRUCTURE_QUERY = 1 << 14;
         /// Buffer used for storing opaque shader data
         const RAY_TRACING_PIPELINE_SHADER_DATA = 1 << 15;
+        /// Backing memory of a work graph.
+        const WORK_GRAPH_BACKING_MEMORY = 1 << 16;
         /// The combination of states that a buffer may be in _at the same time_.
         const INCLUSIVE = Self::MAP_READ.bits() | Self::COPY_SRC.bits() |
             Self::INDEX.bits() | Self::VERTEX.bits() | Self::UNIFORM.bits() |
             Self::STORAGE_READ_ONLY.bits() | Self::INDIRECT.bits() | Self::BOTTOM_LEVEL_ACCELERATION_STRUCTURE_INPUT.bits() | Self::TOP_LEVEL_ACCELERATION_STRUCTURE_INPUT.bits() | Self::RAY_TRACING_PIPELINE_SHADER_DATA.bits();
         /// The combination of states that a buffer must exclusively be in.
-        const EXCLUSIVE = Self::MAP_WRITE.bits() | Self::COPY_DST.bits() | Self::STORAGE_READ_WRITE.bits() | Self::ACCELERATION_STRUCTURE_SCRATCH.bits();
+        const EXCLUSIVE = Self::MAP_WRITE.bits() | Self::COPY_DST.bits() | Self::STORAGE_READ_WRITE.bits() | Self::ACCELERATION_STRUCTURE_SCRATCH.bits() | Self::WORK_GRAPH_BACKING_MEMORY.bits();
     }
 }
 

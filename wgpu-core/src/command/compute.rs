@@ -29,7 +29,7 @@ use crate::{
     device::{Device, DeviceError, MissingDownlevelFlags, MissingFeatures},
     hal_label, id, impl_resource_type,
     init_tracker::MemoryInitKind,
-    pipeline::ComputePipeline,
+    pipeline::{ComputePipeline, WorkGraphPipeline},
     resource::{
         Buffer, DestroyedResourceError, InvalidOrDestroyedResourceError, InvalidResourceError,
         Labeled, MissingBufferUsageError, ParentDevice, QuerySet, RawResourceAccess, TextureView,
@@ -157,6 +157,61 @@ impl WebGpuError for DispatchError {
     }
 }
 
+#[derive(Clone, Debug, Error)]
+#[non_exhaustive]
+pub enum WorkGraphError {
+    #[error("Work graph pipeline must be set")]
+    MissingPipeline,
+    #[error(
+        "Backing memory offset {0} is not a multiple of {alignment}",
+        alignment = wgt::WORK_GRAPH_BACKING_MEMORY_ALIGNMENT
+    )]
+    UnalignedBackingMemoryOffset(BufferAddress),
+    #[error("Backing memory of {size} bytes starting at offset {offset} would overrun buffer of size {buffer_size}")]
+    BackingMemoryOverrun {
+        offset: BufferAddress,
+        size: BufferAddress,
+        buffer_size: BufferAddress,
+    },
+    #[error("Backing memory of {size} bytes is smaller than the minimum size {min_size} required by the work graph")]
+    BackingMemoryTooSmall {
+        size: BufferAddress,
+        min_size: BufferAddress,
+    },
+    #[error("Entrypoint index {index} of input {input} is out of range for a work graph with {count} entrypoints")]
+    InvalidEntrypoint {
+        input: usize,
+        index: u32,
+        count: usize,
+    },
+    #[error(
+        "Record stride {stride} of input {input} is smaller than the record size {record_size}"
+    )]
+    RecordStrideTooSmall {
+        input: usize,
+        stride: u64,
+        record_size: u32,
+    },
+    #[error("Record stride {stride} of input {input} is not a multiple of {alignment}")]
+    UnalignedRecordStride {
+        input: usize,
+        stride: u64,
+        alignment: u64,
+    },
+    #[error("Input {input} provides {size} bytes of records, but {required} bytes are required")]
+    RecordsTooSmall {
+        input: usize,
+        size: u64,
+        required: u64,
+    },
+}
+
+impl WebGpuError for WorkGraphError {
+    fn webgpu_error_type(&self) -> ErrorType {
+        ErrorType::Validation
+    }
+}
+
 /// Error encountered when performing a compute pass.
 #[derive(Clone, Debug, Error)]
 pub enum ComputePassErrorInner {
@@ -186,6 +241,8 @@ pub enum ComputePassErrorInner {
     MissingBufferUsage(#[from] MissingBufferUsageError),
     #[error(transparent)]
     Dispatch(#[from] DispatchError),
+    #[error(transparent)]
+    WorkGraph(#[from] WorkGraphError),
     #[error(transparent)]
     Bind(#[from] BindError),
     #[error(transparent)]
@@ -254,6 +311,7 @@ impl WebGpuError for ComputePassError {
             ComputePassErrorInner::ResourceUsageCompatibility(e) => e.webgpu_error_type(),
             ComputePassErrorInner::MissingBufferUsage(e) => e.webgpu_error_type(),
             ComputePassErrorInner::Dispatch(e) => e.webgpu_error_type(),
+            ComputePassErrorInner::WorkGraph(e) => e.webgpu_error_type(),
             ComputePassErrorInner::Bind(e) => e.webgpu_error_type(),
             ComputePassErrorInner::ImmediateData(e) => e.webgpu_error_type(),
             ComputePassErrorInner::QueryUse(e) => e.webgpu_error_type(),
@@ -272,8 +330,20 @@ impl WebGpuError for ComputePassError {
     }
 }
 
+struct WorkGraphState {
+    pipeline: Arc<WorkGraphPipeline>,
+    backing_memory: Arc<Buffer>,
+    offset: BufferAddress,
+    size: BufferAddress,
+    /// The backing memory must be initialized by the next dispatch.
+    initialize: bool,
+}
+
 struct State<'scope, 'snatch_guard, 'cmd_enc> {
     pipeline: Option<Arc<ComputePipeline>>,
+
+    /// The work graph pipeline, if one was set more recently than `pipeline`.
+    work_graph: Option<WorkGraphState>,
 
     pass: pass::PassState<'scope, 'snatch_guard, 'cmd_enc>,
 
@@ -306,8 +376,11 @@ impl<'scope, 'snatch_guard, 'cmd_enc> State<'scope, 'snatch_guard, 'cmd_enc> {
     }
 
     fn flush_immediates(&mut self) {
-        let pipeline = self.pipeline.as_ref().unwrap();
-        let layout = pipeline.layout().unwrap();
+        let layout = match (&self.pipeline, &self.work_graph) {
+            (Some(pipeline), _) => pipeline.layout().unwrap(),
+            (None, Some(work_graph)) => work_graph.pipeline.layout().unwrap(),
+            (None, None) => unreachable!(),
+        };
         self.pass
             .immediate_state
             .flush_immediates(layout, self.pass.base.raw_encoder);
@@ -351,10 +424,14 @@ impl<'scope, 'snatch_guard, 'cmd_enc> State<'scope, 'snatch_guard, 'cmd_enc> {
     /// processed by the validation pass and is not used by the actual dispatch.
     /// The indirect validation code handles transitions for the validation
     /// pass.
+    ///
+    /// The `work_graph_backing_memory` argument should be passed for any work
+    /// graph dispatch.
     fn flush_bindings(
         &mut self,
         indirect_buffer: Option<&Arc<Buffer>>,
         track_indirect_buffer: bool,
+        work_graph_backing_memory: Option<&Arc<Buffer>>,
     ) -> Result<(), ComputePassErrorInner> {
         for bind_group in self.pass.binder.list_active() {
             unsafe { self.pass.scope.merge_bind_group(&bind_group.used)? };
@@ -368,6 +445,13 @@ impl<'scope, 'snatch_guard, 'cmd_enc> State<'scope, 'snatch_guard, 'cmd_enc> {
                 .scope
                 .buffers
                 .merge_single(buffer, wgt::BufferUses::INDIRECT)?;
+        }
+
+        if let Some(buffer) = work_graph_backing_memory {
+            self.pass
+                .scope
+                .buffers
+                .merge_single(buffer, wgt::BufferUses::WORK_GRAPH_BACKING_MEMORY)?;
         }
 
         // For compute, usage scopes are associated with each dispatch and not
@@ -392,6 +476,15 @@ impl<'scope, 'snatch_guard, 'cmd_enc> State<'scope, 'snatch_guard, 'cmd_enc> {
                 .scope
                 .buffers
                 .remove_usage(buffer, wgt::BufferUses::INDIRECT);
+        }
+
+        if let Some(buffer) = work_graph_backing_memory {
+            self.intermediate_trackers
+                .buffers
+                .set_and_remove_from_usage_scope_sparse(
+                    &mut self.pass.scope.buffers,
+                    [buffer.tracker_index()],
+                );
         }
 
         flush_bindings_helper(&mut self.pass)?;
@@ -644,6 +737,7 @@ pub(super) fn encode_compute_pass(
 
     let mut state = State {
         pipeline: None,
+        work_graph: None,
 
         pass: pass::PassState {
             base: EncodingState {
@@ -770,6 +864,16 @@ pub(super) fn encode_compute_pass(
                 let scope = PassErrorScope::SetPipelineCompute;
                 set_pipeline(&mut state, device, pipeline).map_pass_err(scope)?;
             }
+            ArcComputeCommand::SetWorkGraphPipeline {
+                pipeline,
+                backing_memory,
+                offset,
+                size,
+            } => {
+                let scope = PassErrorScope::SetPipelineWorkGraph;
+                set_work_graph_pipeline(&mut state, device, pipeline, backing_memory, offset, size)
+                    .map_pass_err(scope)?;
+            }
             ArcComputeCommand::SetImmediate { offset, data } => {
                 let scope = PassErrorScope::SetImmediate;
                 state
@@ -790,6 +894,10 @@ pub(super) fn encode_compute_pass(
                 let scope = PassErrorScope::Dispatch { indirect: true };
                 dispatch_workgroups_indirect(&mut state, device, buffer, offset)
                     .map_pass_err(scope)?;
+            }
+            ArcComputeCommand::DispatchGraph { inputs } => {
+                let scope = PassErrorScope::DispatchGraph;
+                dispatch_graph(&mut state, inputs).map_pass_err(scope)?;
             }
             ArcComputeCommand::PushDebugGroup { color: _, len } => {
                 pass::push_debug_group(&mut state.pass, &base.string_data, len);
@@ -919,6 +1027,7 @@ fn set_pipeline(
     pipeline.same_device(device)?;
 
     state.pipeline = Some(pipeline.clone());
+    state.work_graph = None;
 
     let pipeline = state
         .pass
@@ -950,7 +1059,7 @@ fn dispatch_workgroups(state: &mut State, groups: [u32; 3]) -> Result<(), Comput
 
     state.is_ready()?;
 
-    state.flush_bindings(None, false)?;
+    state.flush_bindings(None, false, None)?;
     state.flush_immediates();
 
     let groups_size_limit = state
@@ -1137,7 +1246,7 @@ fn dispatch_workgroups_indirect(
                 }]);
         }
 
-        state.flush_bindings(Some(&buffer), false)?;
+        state.flush_bindings(Some(&buffer), false, None)?;
         unsafe {
             state
                 .pass
@@ -1146,7 +1255,7 @@ fn dispatch_workgroups_indirect(
                 .dispatch_workgroups_indirect(params.dst_buffer, 0);
         }
     } else {
-        state.flush_bindings(Some(&buffer), true)?;
+        state.flush_bindings(Some(&buffer), true, None)?;
         state.flush_immediates();
         let buf_raw = buffer.try_raw(state.pass.base.snatch_guard)?;
         unsafe {
@@ -1158,6 +1267,178 @@ fn dispatch_workgroups_indirect(
         }
     }
 
+    Ok(())
+}
+
+fn set_work_graph_pipeline(
+    state: &mut State,
+    device: &Arc<Device>,
+    pipeline: Arc<WorkGraphPipeline>,
+    backing_memory: Arc<Buffer>,
+    offset: BufferAddress,
+    size: Option<BufferAddress>,
+) -> Result<(), ComputePassErrorInner> {
+    device.require_features(wgt::Features::EXPERIMENTAL_WORK_GRAPHS)?;
+    pipeline.same_device(device)?;
+    backing_memory.same_device(device)?;
+    backing_memory.check_usage(wgt::BufferUsages::STORAGE)?;
+    backing_memory.check_destroyed(state.pass.base.snatch_guard)?;
+
+    if !offset.is_multiple_of(wgt::WORK_GRAPH_BACKING_MEMORY_ALIGNMENT) {
+        return Err(WorkGraphError::UnalignedBackingMemoryOffset(offset).into());
+    }
+    let buffer_size = backing_memory.size;
+    let size = size.unwrap_or(buffer_size.saturating_sub(offset));
+    if offset > buffer_size || buffer_size - offset < size {
+        return Err(WorkGraphError::BackingMemoryOverrun {
+            offset,
+            size,
+            buffer_size,
+        }
+        .into());
+    }
+    let min_size = pipeline.memory_requirements.min_size;
+    if size < min_size {
+        return Err(WorkGraphError::BackingMemoryTooSmall { size, min_size }.into());
+    }
+
+    let pipeline = state
+        .pass
+        .base
+        .tracker
+        .work_graph_pipelines
+        .insert_single(pipeline)
+        .clone();
+
+    unsafe {
+        state
+            .pass
+            .base
+            .raw_encoder
+            .set_work_graph_pipeline(pipeline.raw()?);
+    }
+
+    // Rebind resources
+    pass::change_pipeline_layout::<ComputePassErrorInner>(
+        &mut state.pass,
+        pipeline.layout()?,
+        &pipeline.late_sized_buffer_groups,
+    )?;
+
+    state.pipeline = None;
+    state.work_graph = Some(WorkGraphState {
+        pipeline,
+        backing_memory,
+        offset,
+        size,
+        initialize: true,
+    });
+    Ok(())
+}
+
+fn dispatch_graph(
+    state: &mut State,
+    inputs: Vec<wgt::WorkGraphNodeInput<Vec<u8>>>,
+) -> Result<(), ComputePassErrorInner> {
+    api_log!("ComputePass::dispatch_graph");
+
+    let Some(work_graph) = state.work_graph.as_ref() else {
+        return Err(WorkGraphError::MissingPipeline.into());
+    };
+
+    state
+        .pass
+        .binder
+        .check_compatibility(work_graph.pipeline.as_ref())
+        .map_err(DispatchError::from)?;
+    state
+        .pass
+        .binder
+        .check_late_buffer_bindings()
+        .map_err(DispatchError::from)?;
+
+    let entrypoints = &work_graph.pipeline.entrypoints;
+    for (input_index, input) in inputs.iter().enumerate() {
+        let Some(entrypoint) = entrypoints.get(input.entrypoint_index as usize) else {
+            return Err(WorkGraphError::InvalidEntrypoint {
+                input: input_index,
+                index: input.entrypoint_index,
+                count: entrypoints.len(),
+            }
+            .into());
+        };
+        if entrypoint.record_size != 0 && input.record_stride != 0 {
+            if input.record_stride < u64::from(entrypoint.record_size) {
+                return Err(WorkGraphError::RecordStrideTooSmall {
+                    input: input_index,
+                    stride: input.record_stride,
+                    record_size: entrypoint.record_size,
+                }
+                .into());
+            }
+            let alignment = entrypoint.record_stride_alignment();
+            if !input.record_stride.is_multiple_of(alignment) {
+                return Err(WorkGraphError::UnalignedRecordStride {
+                    input: input_index,
+                    stride: input.record_stride,
+                    alignment,
+                }
+                .into());
+            }
+        }
+        let required = entrypoint.required_records_size(input.num_records, input.record_stride);
+        let size = input.records.len() as u64;
+        if size < required {
+            return Err(WorkGraphError::RecordsTooSmall {
+                input: input_index,
+                size,
+                required,
+            }
+            .into());
+        }
+    }
+
+    if inputs.is_empty() {
+        return Ok(());
+    }
+
+    let backing_memory = work_graph.backing_memory.clone();
+    let offset = work_graph.offset;
+    let size = work_graph.size;
+    let initialize = work_graph.initialize;
+
+    state.flush_bindings(None, false, Some(&backing_memory))?;
+    state.flush_immediates();
+
+    let inputs = inputs
+        .iter()
+        .map(|input| wgt::WorkGraphNodeInput {
+            entrypoint_index: input.entrypoint_index,
+            num_records: input.num_records,
+            record_stride: input.record_stride,
+            records: input.records.as_slice(),
+        })
+        .collect::<Vec<_>>();
+    let raw_backing_memory = backing_memory.try_raw(state.pass.base.snatch_guard)?;
+    unsafe {
+        state
+            .pass
+            .base
+            .raw_encoder
+            .dispatch_graph(&hal::DispatchGraphDescriptor {
+                backing_memory: hal::WorkGraphBackingMemory {
+                    buffer: raw_backing_memory,
+                    offset,
+                    size,
+                },
+                initialize,
+                inputs: &inputs,
+            });
+    }
+
+    if let Some(work_graph) = state.work_graph.as_mut() {
+        work_graph.initialize = false;
+    }
     Ok(())
 }
 
@@ -1254,6 +1535,84 @@ impl ComputePass {
         if let Err(error) = self.set_pipeline_inner(compute_pipeline) {
             self.device
                 .handle_error(error, self.label(), "ComputePass::set_pipeline");
+        }
+    }
+
+    fn set_work_graph_pipeline_inner(
+        &mut self,
+        pipeline: Arc<WorkGraphPipeline>,
+        backing_memory: Arc<Buffer>,
+        offset: BufferAddress,
+        size: Option<BufferAddress>,
+    ) -> Result<(), PassStateError> {
+        let scope = PassErrorScope::SetPipelineWorkGraph;
+        let base = pass_base!(self, scope);
+
+        // A compute pipeline must be set again after the work graph pipeline.
+        self.current_pipeline.reset();
+
+        pass_try!(base, scope, pipeline.check_valid());
+        pass_try!(base, scope, backing_memory.check_is_valid());
+
+        base.commands.push(ArcComputeCommand::SetWorkGraphPipeline {
+            pipeline,
+            backing_memory,
+            offset,
+            size,
+        });
+
+        Ok(())
+    }
+
+    /// Sets the work graph pipeline used by subsequent calls to
+    /// [`dispatch_graph`](Self::dispatch_graph), and the buffer region holding its backing memory.
+    pub fn set_work_graph_pipeline(
+        &mut self,
+        pipeline: Arc<WorkGraphPipeline>,
+        backing_memory: Arc<Buffer>,
+        offset: BufferAddress,
+        size: Option<BufferAddress>,
+    ) {
+        if let Err(error) =
+            self.set_work_graph_pipeline_inner(pipeline, backing_memory, offset, size)
+        {
+            self.device
+                .handle_error(error, self.label(), "ComputePass::set_work_graph_pipeline");
+        }
+    }
+
+    fn dispatch_graph_inner(
+        &mut self,
+        inputs: &[wgt::WorkGraphNodeInput<&[u8]>],
+    ) -> Result<(), PassStateError> {
+        let scope = PassErrorScope::DispatchGraph;
+        let base = pass_base!(self, scope);
+
+        base.commands.push(ArcComputeCommand::DispatchGraph {
+            inputs: inputs
+                .iter()
+                .map(|input| wgt::WorkGraphNodeInput {
+                    entrypoint_index: input.entrypoint_index,
+                    num_records: input.num_records,
+                    record_stride: input.record_stride,
+                    records: input.records.to_vec(),
+                })
+                .collect(),
+        });
+
+        Ok(())
+    }
+
+    /// Submits input records to the entrypoints of the current work graph pipeline.
+    ///
+    /// # Safety
+    ///
+    /// The input records must not violate any limits declared by the nodes receiving them,
+    /// such as `SV_DispatchGrid` exceeding `NodeMaxDispatchGrid`.
+    pub unsafe fn dispatch_graph(&mut self, inputs: &[wgt::WorkGraphNodeInput<&[u8]>]) {
+        if let Err(error) = self.dispatch_graph_inner(inputs) {
+            self.device
+                .handle_error(error, self.label(), "ComputePass::dispatch_graph");
         }
     }
 

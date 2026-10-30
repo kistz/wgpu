@@ -2362,6 +2362,184 @@ impl crate::Device for super::Device {
         unimplemented!("ray tracing pipelines not yet implemented")
     }
 
+    unsafe fn create_work_graph_pipeline(
+        &self,
+        desc: &crate::WorkGraphPipelineDescriptor<super::PipelineLayout, super::ShaderModule>,
+    ) -> Result<(super::WorkGraphPipeline, crate::WorkGraphPipelineInfo), crate::PipelineError>
+    {
+        use windows::core::{HSTRING, PCWSTR};
+
+        let compiled_library;
+        let library = match &desc.module.source {
+            super::ShaderModuleSource::DxilPassthrough(passthrough) => {
+                Direct3D12::D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: passthrough.shader.as_ptr().cast(),
+                    BytecodeLength: passthrough.shader.len(),
+                }
+            }
+            super::ShaderModuleSource::HlslPassthrough(passthrough) => {
+                let target = format!("lib_{}", desc.layout.naga_options.shader_model.to_str());
+                compiled_library = self.compiler_container.compile_library(
+                    self,
+                    &passthrough.shader,
+                    desc.module.raw_name.as_deref(),
+                    &target,
+                )?;
+                compiled_library.create_native_shader()
+            }
+            super::ShaderModuleSource::Naga(_) => {
+                return Err(crate::PipelineError::WorkGraph(String::from(
+                    "Work graphs require a DXIL or HLSL shader library",
+                )));
+            }
+        };
+
+        let program_name = HSTRING::from(desc.program_name);
+        let entrypoint_names = desc
+            .entrypoints
+            .iter()
+            .map(|node| HSTRING::from(&*node.name))
+            .collect::<Vec<_>>();
+        let entrypoints = desc
+            .entrypoints
+            .iter()
+            .zip(&entrypoint_names)
+            .map(|(node, name)| Direct3D12::D3D12_NODE_ID {
+                Name: PCWSTR(name.as_ptr()),
+                ArrayIndex: node.array_index,
+            })
+            .collect::<Vec<_>>();
+
+        let library_desc = Direct3D12::D3D12_DXIL_LIBRARY_DESC {
+            DXILLibrary: library,
+            NumExports: 0,
+            pExports: ptr::null(),
+        };
+        let root_signature_desc = Direct3D12::D3D12_GLOBAL_ROOT_SIGNATURE {
+            pGlobalRootSignature: unsafe {
+                borrow_optional_interface_temporarily(&desc.layout.shared.signature)
+            },
+        };
+        let work_graph_desc = Direct3D12::D3D12_WORK_GRAPH_DESC {
+            ProgramName: PCWSTR(program_name.as_ptr()),
+            Flags: if desc.include_all_available_nodes {
+                Direct3D12::D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES
+            } else {
+                Direct3D12::D3D12_WORK_GRAPH_FLAG_NONE
+            },
+            NumEntrypoints: entrypoints.len() as u32,
+            pEntrypoints: entrypoints.as_ptr(),
+            NumExplicitlyDefinedNodes: 0,
+            pExplicitlyDefinedNodes: ptr::null(),
+        };
+        let subobjects = [
+            Direct3D12::D3D12_STATE_SUBOBJECT {
+                Type: Direct3D12::D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY,
+                pDesc: ptr::from_ref(&library_desc).cast(),
+            },
+            Direct3D12::D3D12_STATE_SUBOBJECT {
+                Type: Direct3D12::D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE,
+                pDesc: ptr::from_ref(&root_signature_desc).cast(),
+            },
+            Direct3D12::D3D12_STATE_SUBOBJECT {
+                Type: Direct3D12::D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH,
+                pDesc: ptr::from_ref(&work_graph_desc).cast(),
+            },
+        ];
+        let state_object_desc = Direct3D12::D3D12_STATE_OBJECT_DESC {
+            Type: Direct3D12::D3D12_STATE_OBJECT_TYPE_EXECUTABLE,
+            NumSubobjects: subobjects.len() as u32,
+            pSubobjects: subobjects.as_ptr(),
+        };
+
+        let to_pipeline_error =
+            |err: windows::core::Error| crate::PipelineError::WorkGraph(err.message());
+        let device5 = self
+            .raw
+            .cast::<Direct3D12::ID3D12Device5>()
+            .map_err(to_pipeline_error)?;
+        let raw: Direct3D12::ID3D12StateObject = {
+            profiling::scope!("ID3D12Device5::CreateStateObject");
+            unsafe { device5.CreateStateObject(&state_object_desc) }.map_err(to_pipeline_error)?
+        };
+
+        let properties = raw
+            .cast::<Direct3D12::ID3D12WorkGraphProperties>()
+            .map_err(to_pipeline_error)?;
+        let program_properties = raw
+            .cast::<Direct3D12::ID3D12StateObjectProperties1>()
+            .map_err(to_pipeline_error)?;
+
+        let graph_index = unsafe { properties.GetWorkGraphIndex(&program_name) };
+        if graph_index == u32::MAX {
+            return Err(crate::PipelineError::WorkGraph(format!(
+                "The shader library contains no work graph named {:?}",
+                desc.program_name
+            )));
+        }
+
+        let program_identifier = unsafe { program_properties.GetProgramIdentifier(&program_name) };
+        if program_identifier.OpaqueData == [0; 4] {
+            return Err(crate::PipelineError::WorkGraph(String::from(
+                "The work graph has no nodes",
+            )));
+        }
+
+        let uses_local_root_arguments = (0..unsafe { properties.GetNumNodes(graph_index) }).any(
+            |node| unsafe { properties.GetNodeLocalRootArgumentsTableIndex(graph_index, node) }
+                != u32::MAX,
+        );
+        if uses_local_root_arguments {
+            return Err(crate::PipelineError::WorkGraph(String::from(
+                "Local root arguments are not supported",
+            )));
+        }
+
+        let entrypoints = (0..unsafe { properties.GetNumEntrypoints(graph_index) })
+            .map(|index| unsafe {
+                let node = properties.GetEntrypointID(graph_index, index);
+                wgt::WorkGraphEntrypoint {
+                    node: wgt::WorkGraphNodeId {
+                        name: Cow::Owned(node.Name.to_string().unwrap_or_default()),
+                        array_index: node.ArrayIndex,
+                    },
+                    record_size: properties.GetEntrypointRecordSizeInBytes(graph_index, index),
+                    record_alignment: properties
+                        .GetEntrypointRecordAlignmentInBytes(graph_index, index),
+                }
+            })
+            .collect();
+
+        let mut memory_requirements = Direct3D12::D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS::default();
+        unsafe { properties.GetWorkGraphMemoryRequirements(graph_index, &mut memory_requirements) };
+
+        if let Some(label) = desc.label {
+            raw.set_name(label)?;
+        }
+
+        self.counters.work_graph_pipelines.add(1);
+
+        Ok((
+            super::WorkGraphPipeline {
+                _raw: raw,
+                program_identifier,
+                layout: desc.layout.shared.clone(),
+            },
+            crate::WorkGraphPipelineInfo {
+                memory_requirements: wgt::WorkGraphMemoryRequirements {
+                    min_size: memory_requirements.MinSizeInBytes,
+                    max_size: memory_requirements.MaxSizeInBytes,
+                    size_granularity: memory_requirements.SizeGranularityInBytes.into(),
+                },
+                entrypoints,
+            },
+        ))
+    }
+
+    unsafe fn destroy_work_graph_pipeline(&self, _pipeline: super::WorkGraphPipeline) {
+        self.counters.work_graph_pipelines.sub(1);
+    }
+
     unsafe fn create_pipeline_cache(
         &self,
         _desc: &crate::PipelineCacheDescriptor<'_>,

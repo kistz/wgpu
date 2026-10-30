@@ -1400,6 +1400,12 @@ pub struct WebBlas {
 }
 
 #[derive(Debug, Clone)]
+pub struct WebWorkGraphPipeline {
+    /// Unique identifier for this WorkGraphPipeline.
+    ident: crate::cmp::Identifier,
+}
+
+#[derive(Debug, Clone)]
 pub struct WebTlas {
     /// Unique identifier for this Blas.
     ident: crate::cmp::Identifier,
@@ -1540,6 +1546,7 @@ impl_send_sync!(WebTexture);
 impl_send_sync!(WebExternalTexture);
 impl_send_sync!(WebBlas);
 impl_send_sync!(WebTlas);
+impl_send_sync!(WebWorkGraphPipeline);
 impl_send_sync!(WebQuerySet);
 impl_send_sync!(WebPipelineLayout);
 impl_send_sync!(WebRenderPipeline);
@@ -1570,6 +1577,7 @@ crate::cmp::impl_eq_ord_hash_proxy!(WebTexture => .ident);
 crate::cmp::impl_eq_ord_hash_proxy!(WebExternalTexture => .ident);
 crate::cmp::impl_eq_ord_hash_proxy!(WebBlas => .ident);
 crate::cmp::impl_eq_ord_hash_proxy!(WebTlas => .ident);
+crate::cmp::impl_eq_ord_hash_proxy!(WebWorkGraphPipeline => .ident);
 crate::cmp::impl_eq_ord_hash_proxy!(WebQuerySet => .ident);
 crate::cmp::impl_eq_ord_hash_proxy!(WebPipelineLayout => .ident);
 crate::cmp::impl_eq_ord_hash_proxy!(WebRenderPipeline => .ident);
@@ -2669,6 +2677,13 @@ impl dispatch::DeviceInterface for WebDevice {
         unimplemented!("Raytracing not implemented for web");
     }
 
+    fn create_work_graph_pipeline(
+        &self,
+        _desc: &crate::WorkGraphPipelineDescriptor<'_>,
+    ) -> dispatch::DispatchWorkGraphPipeline {
+        unimplemented!("Work graphs are not implemented for web")
+    }
+
     fn create_tlas(&self, _desc: &crate::CreateTlasDescriptor<'_>) -> dispatch::DispatchTlas {
         unimplemented!("Raytracing not implemented for web");
     }
@@ -3276,6 +3291,20 @@ impl Drop for WebBlas {
 }
 
 impl dispatch::TlasInterface for WebTlas {}
+impl dispatch::WorkGraphPipelineInterface for WebWorkGraphPipeline {
+    fn memory_requirements(&self) -> wgt::WorkGraphMemoryRequirements {
+        unimplemented!("Work graphs are not implemented for web")
+    }
+
+    fn entrypoints(&self) -> &[wgt::WorkGraphEntrypoint] {
+        unimplemented!("Work graphs are not implemented for web")
+    }
+}
+impl Drop for WebWorkGraphPipeline {
+    fn drop(&mut self) {
+        // no-op
+    }
+}
 impl Drop for WebTlas {
     fn drop(&mut self) {
         // no-op
@@ -3773,6 +3802,20 @@ impl dispatch::ComputePassInterface for WebComputePassEncoder {
 
         self.inner
             .dispatch_workgroups_indirect_with_f64(&indirect_buffer.inner, indirect_offset as f64);
+    }
+
+    fn set_work_graph_pipeline(
+        &mut self,
+        _pipeline: &dispatch::DispatchWorkGraphPipeline,
+        _backing_memory: &dispatch::DispatchBuffer,
+        _offset: crate::BufferAddress,
+        _size: crate::BufferAddress,
+    ) {
+        unimplemented!("Work graphs are not implemented for web")
+    }
+
+    unsafe fn dispatch_graph(&mut self, _inputs: &[wgt::WorkGraphNodeInput<&[u8]>]) {
+        unimplemented!("Work graphs are not implemented for web")
     }
 
     fn transition_resources<'a>(

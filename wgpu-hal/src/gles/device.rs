@@ -1752,6 +1752,18 @@ impl crate::Device for super::Device {
         unimplemented!("Ray tracing is unsupported on GL")
     }
 
+    unsafe fn create_work_graph_pipeline(
+        &self,
+        _desc: &crate::WorkGraphPipelineDescriptor<super::PipelineLayout, super::ShaderModule>,
+    ) -> Result<(super::WorkGraphPipeline, crate::WorkGraphPipelineInfo), crate::PipelineError>
+    {
+        unimplemented!("Work graphs are unsupported on GL")
+    }
+
+    unsafe fn destroy_work_graph_pipeline(&self, _pipeline: super::WorkGraphPipeline) {
+        unimplemented!("Work graphs are unsupported on GL")
+    }
+
     unsafe fn create_pipeline_cache(
         &self,
         _: &crate::PipelineCacheDescriptor<'_>,

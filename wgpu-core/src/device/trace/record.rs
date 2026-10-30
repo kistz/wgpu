@@ -15,7 +15,7 @@ use crate::{
 
 use super::{
     Action, TraceBindGroupDescriptor, TraceComputePipelineDescriptor,
-    TraceGeneralRenderPipelineDescriptor, FILE_NAME,
+    TraceGeneralRenderPipelineDescriptor, TraceWorkGraphPipelineDescriptor, FILE_NAME,
 };
 
 pub(crate) fn new_render_bundle_encoder_descriptor(
@@ -468,12 +468,24 @@ impl IntoTrace for ArcComputeCommand {
                 bind_group: bind_group.map(|bg| bg.into_trace()),
             },
             C::SetPipeline(id) => C::SetPipeline(id.into_trace()),
+            C::SetWorkGraphPipeline {
+                pipeline,
+                backing_memory,
+                offset,
+                size,
+            } => C::SetWorkGraphPipeline {
+                pipeline: pipeline.into_trace(),
+                backing_memory: backing_memory.into_trace(),
+                offset,
+                size,
+            },
             C::SetImmediate { offset, data } => C::SetImmediate { offset, data },
             C::DispatchWorkgroups(groups) => C::DispatchWorkgroups(groups),
             C::DispatchWorkgroupsIndirect { buffer, offset } => C::DispatchWorkgroupsIndirect {
                 buffer: buffer.into_trace(),
                 offset,
             },
+            C::DispatchGraph { inputs } => C::DispatchGraph { inputs },
             C::PushDebugGroup { color, len } => C::PushDebugGroup { color, len },
             C::PopDebugGroup => C::PopDebugGroup,
             C::InsertDebugMarker { color, len } => C::InsertDebugMarker { color, len },
@@ -773,6 +785,21 @@ impl<'a> IntoTrace for crate::pipeline::ComputePipelineDescriptor<'a> {
     }
 }
 
+impl<'a> IntoTrace for crate::pipeline::WorkGraphPipelineDescriptor<'a> {
+    type Output = TraceWorkGraphPipelineDescriptor<'a>;
+
+    fn into_trace(self) -> Self::Output {
+        TraceWorkGraphPipelineDescriptor {
+            label: self.label,
+            layout: self.layout.into_trace(),
+            module: self.module.into_trace(),
+            program_name: self.program_name,
+            entrypoints: self.entrypoints,
+            include_all_available_nodes: self.include_all_available_nodes,
+        }
+    }
+}
+
 impl<'a> IntoTrace for crate::pipeline::ProgrammableStageDescriptor<'a> {
     type Output =
         crate::pipeline::ProgrammableStageDescriptor<'a, PointerId<markers::ShaderModule>>;
@@ -916,6 +943,7 @@ fn action_to_owned(action: Action<'_, PointerReferences>) -> Action<'static, Poi
         A::DropBindGroup(bind_group) => A::DropBindGroup(bind_group),
         A::DropShaderModule(shader_module) => A::DropShaderModule(shader_module),
         A::DropComputePipeline(pipeline) => A::DropComputePipeline(pipeline),
+        A::DropWorkGraphPipeline(pipeline) => A::DropWorkGraphPipeline(pipeline),
         A::DropRenderPipeline(pipeline) => A::DropRenderPipeline(pipeline),
         A::DropPipelineCache(cache) => A::DropPipelineCache(cache),
         A::DropRenderBundle(render_bundle) => A::DropRenderBundle(render_bundle),
@@ -1096,6 +1124,21 @@ fn action_to_owned(action: Action<'_, PointerReferences>) -> Action<'static, Poi
                 layout: desc.layout,
                 stage: owned_stage(desc.stage),
                 cache: desc.cache,
+            },
+        },
+        A::CreateWorkGraphPipeline { id, desc } => A::CreateWorkGraphPipeline {
+            id,
+            desc: crate::pipeline::WorkGraphPipelineDescriptor {
+                label: owned_label(&desc.label),
+                layout: desc.layout,
+                module: desc.module,
+                program_name: Cow::Owned(desc.program_name.into_owned()),
+                entrypoints: desc
+                    .entrypoints
+                    .iter()
+                    .map(|node| node.clone().into_owned())
+                    .collect(),
+                include_all_available_nodes: desc.include_all_available_nodes,
             },
         },
         A::CreateGeneralRenderPipeline { id, desc } => A::CreateGeneralRenderPipeline {

@@ -92,8 +92,13 @@ struct Example {
 
 impl Example {
     fn generate_matrix(aspect_ratio: f32) -> glam::Mat4 {
-        let projection = glam::Mat4::perspective_rh(consts::FRAC_PI_4, aspect_ratio, 1.0, 10.0);
-        let view = glam::Mat4::look_at_rh(
+        let projection = glam::camera::rh::proj::directx::perspective(
+            consts::FRAC_PI_4,
+            aspect_ratio,
+            1.0,
+            10.0,
+        );
+        let view = glam::camera::rh::view::look_at_mat4(
             glam::Vec3::new(1.5f32, -5.0, 3.0),
             glam::Vec3::ZERO,
             glam::Vec3::Z,
@@ -337,11 +342,6 @@ impl crate::framework::Example for Example {
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
-            unsafe {
-                encoder.as_hal_mut(|h: Option<wgpu::hal::dx12::CommandEncoder>| unsafe {
-                    h.unwrap().draw_graph()
-                });
-            }
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -384,40 +384,3 @@ impl crate::framework::Example for Example {
 pub fn main() {
     crate::framework::run::<Example>("cube");
 }
-
-#[cfg(test)]
-#[wgpu_test::gpu_test]
-pub static TEST: crate::framework::ExampleTestParams = crate::framework::ExampleTestParams {
-    name: "cube",
-    // Generated on 1080ti on Vk/Windows
-    image_path: "/examples/features/src/cube/screenshot.png",
-    width: 1024,
-    height: 768,
-    optional_features: wgpu::Features::default(),
-    base_test_parameters: wgpu_test::TestParameters::default(),
-    comparisons: &[
-        wgpu_test::ComparisonType::Mean(0.041), // Bounded by Apple A9
-    ],
-    _phantom: std::marker::PhantomData::<Example>,
-};
-
-#[cfg(test)]
-#[wgpu_test::gpu_test]
-pub static TEST_LINES: crate::framework::ExampleTestParams = crate::framework::ExampleTestParams {
-    name: "cube-lines",
-    // Generated on 1080ti on Vk/Windows
-    image_path: "/examples/features/src/cube/screenshot-lines.png",
-    width: 1024,
-    height: 768,
-    optional_features: wgpu::Features::POLYGON_MODE_LINE,
-    base_test_parameters: wgpu_test::TestParameters::default(),
-    // We're looking for tiny changes here, so we focus on a spike in the 95th percentile.
-    comparisons: &[
-        wgpu_test::ComparisonType::Mean(0.05), // Bounded by Intel 630 on Vk/Windows
-        wgpu_test::ComparisonType::Percentile {
-            percentile: 0.95,
-            threshold: 0.36,
-        }, // Bounded by 1080ti on DX12
-    ],
-    _phantom: std::marker::PhantomData::<Example>,
-};

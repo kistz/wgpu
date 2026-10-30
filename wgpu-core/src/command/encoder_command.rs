@@ -21,6 +21,7 @@ pub trait ReferenceType {
     type RenderPipeline: Clone + core::fmt::Debug;
     type RenderBundle: Clone + core::fmt::Debug;
     type ComputePipeline: Clone + core::fmt::Debug;
+    type WorkGraphPipeline: Clone + core::fmt::Debug;
     type Blas: Clone + core::fmt::Debug;
     type Tlas: Clone + core::fmt::Debug;
 }
@@ -51,6 +52,7 @@ impl ReferenceType for PointerReferences {
     type RenderPipeline = crate::id::PointerId<crate::id::markers::RenderPipeline>;
     type RenderBundle = crate::id::PointerId<crate::id::markers::RenderBundle>;
     type ComputePipeline = crate::id::PointerId<crate::id::markers::ComputePipeline>;
+    type WorkGraphPipeline = crate::id::PointerId<crate::id::markers::WorkGraphPipeline>;
     type Blas = crate::id::PointerId<crate::id::markers::Blas>;
     type Tlas = crate::id::PointerId<crate::id::markers::Tlas>;
 }
@@ -66,6 +68,7 @@ impl ReferenceType for ArcReferences {
     type RenderPipeline = Arc<crate::pipeline::RenderPipeline>;
     type RenderBundle = Arc<crate::command::RenderBundle>;
     type ComputePipeline = Arc<crate::pipeline::ComputePipeline>;
+    type WorkGraphPipeline = Arc<crate::pipeline::WorkGraphPipeline>;
     type Blas = Arc<crate::resource::Blas>;
     type Tlas = Arc<crate::resource::Tlas>;
 }
@@ -85,6 +88,7 @@ attribute_alias! {
           R::RenderPipeline: serde::Serialize + for<'d> serde::Deserialize<'d>,\
           R::RenderBundle: serde::Serialize + for<'d> serde::Deserialize<'d>,\
           R::ComputePipeline: serde::Serialize + for<'d> serde::Deserialize<'d>,\
+          R::WorkGraphPipeline: serde::Serialize + for<'d> serde::Deserialize<'d>,\
           R::Blas: serde::Serialize + for<'d> serde::Deserialize<'d>,\
           R::Tlas: serde::Serialize + for<'d> serde::Deserialize<'d>,\
           wgt::BufferTransition<R::Buffer>: serde::Serialize + for<'d> serde::Deserialize<'d>,\

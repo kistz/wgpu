@@ -102,6 +102,41 @@ impl ComputePass<'_> {
             .dispatch_workgroups_indirect(&indirect_buffer.inner, indirect_offset);
     }
 
+    /// Sets the active work graph pipeline and the buffer region holding its backing memory.
+    ///
+    /// This replaces the active compute pipeline.
+    ///
+    /// The backing memory's buffer must have [`BufferUsages::STORAGE`], its offset must be a
+    /// multiple of [`WORK_GRAPH_BACKING_MEMORY_ALIGNMENT`], and its size must be at least
+    /// [`WorkGraphMemoryRequirements::min_size`]. Its contents are overwritten.
+    ///
+    /// Requires [`Features::EXPERIMENTAL_WORK_GRAPHS`].
+    pub fn set_work_graph_pipeline(
+        &mut self,
+        pipeline: &WorkGraphPipeline,
+        backing_memory: BufferSlice<'_>,
+    ) {
+        self.inner.set_work_graph_pipeline(
+            &pipeline.inner,
+            &backing_memory.buffer.inner,
+            backing_memory.offset,
+            backing_memory.size,
+        );
+    }
+
+    /// Submits input records to entrypoints of the active work graph pipeline.
+    ///
+    /// Each input targets the entrypoint at its index in [`WorkGraphPipeline::entrypoints`].
+    /// Records use C struct layout rules. They are copied when this is called.
+    ///
+    /// # Safety
+    ///
+    /// The records must not violate limits declared by the nodes receiving them. For example,
+    /// an `SV_DispatchGrid` value must not exceed the node's `NodeMaxDispatchGrid`.
+    pub unsafe fn dispatch_graph(&mut self, inputs: &[WorkGraphNodeInput<&[u8]>]) {
+        unsafe { self.inner.dispatch_graph(inputs) };
+    }
+
     /// Transition resources to an underlying hal resource state. Compute pass version of
     /// [`CommandEncoder::transition_resources`].
     ///

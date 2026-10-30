@@ -2782,8 +2782,9 @@ impl Device {
         self.require_features(wgt::Features::PASSTHROUGH_SHADERS)?;
 
         // Mainly important for GLSL or SPIR-V or DXIL, which each take exactly 1 entry point.
-        if (descriptor.dxil.is_some() || descriptor.glsl.is_some())
-            && descriptor.entry_points.len() != 1
+        // DXIL libraries, such as work graphs, have none.
+        if (descriptor.glsl.is_some() && descriptor.entry_points.len() != 1)
+            || (descriptor.dxil.is_some() && descriptor.entry_points.len() > 1)
         {
             return Err(pipeline::CreateShaderModuleError::IncorrectPassthroughEntryPointCount);
         }
@@ -2803,7 +2804,8 @@ impl Device {
                     .as_ref()
                     .ok_or(pipeline::CreateShaderModuleError::NotCompiledForBackend)?,
             ),
-            wgt::Backend::Dx12 => {
+            // Noop accepts DX12 sources so that DX12-only features can be validated.
+            wgt::Backend::Dx12 | wgt::Backend::Noop => {
                 if let Some(dxil) = &descriptor.dxil {
                     hal::ShaderInput::Dxil { shader: dxil }
                 } else if let Some(hlsl) = &descriptor.hlsl {
@@ -2833,9 +2835,6 @@ impl Device {
                     .as_ref()
                     .ok_or(pipeline::CreateShaderModuleError::NotCompiledForBackend)?,
             },
-            wgt::Backend::Noop => {
-                return Err(pipeline::CreateShaderModuleError::NotCompiledForBackend)
-            }
             wgt::Backend::BrowserWebGpu => unreachable!(),
         };
 
@@ -4615,6 +4614,93 @@ impl Device {
         }
 
         Ok(pipeline)
+    }
+
+    /// Creates a work graph pipeline. If the creation fails,
+    /// it will handle error in device and return an invalid work graph pipeline.
+    pub fn create_work_graph_pipeline(
+        self: &Arc<Self>,
+        desc: pipeline::WorkGraphPipelineDescriptor,
+    ) -> Arc<pipeline::WorkGraphPipeline> {
+        profiling::scope!("Device::create_work_graph_pipeline");
+        let work_graph_pipeline = self
+            .create_work_graph_pipeline_or_error(desc.clone())
+            .unwrap_or_else(|err| {
+                self.handle_error(
+                    err,
+                    desc.label.as_deref(),
+                    "Device::create_work_graph_pipeline",
+                );
+                pipeline::WorkGraphPipeline::invalid(self.clone(), desc.label.to_string())
+            });
+        #[cfg(feature = "trace")]
+        if let Some(ref mut trace) = *self.trace.lock() {
+            use crate::device::trace;
+            use crate::device::trace::IntoTrace;
+            trace.add(trace::Action::CreateWorkGraphPipeline {
+                id: work_graph_pipeline.to_trace(),
+                desc: desc.to_trace(),
+            });
+        }
+        api_log!(
+            "Device::create_work_graph_pipeline -> {:?}",
+            Arc::as_ptr(&work_graph_pipeline)
+        );
+        work_graph_pipeline
+    }
+
+    /// Creates a work graph pipeline without raising any error to device.
+    pub fn create_work_graph_pipeline_or_error(
+        self: &Arc<Self>,
+        desc: pipeline::WorkGraphPipelineDescriptor,
+    ) -> Result<Arc<pipeline::WorkGraphPipeline>, pipeline::CreatePipelineError> {
+        self.check_is_valid()?;
+        self.require_features(wgt::Features::EXPERIMENTAL_WORK_GRAPHS)?;
+
+        let pipeline_layout = desc.layout;
+        pipeline_layout.same_device(self)?;
+        pipeline_layout.check_valid()?;
+
+        let module = desc.module;
+        module.same_device(self)?;
+        let pipeline::ShaderModuleState::Passthrough {
+            raw: ref raw_module,
+            ..
+        } = *module.state()?
+        else {
+            return Err(pipeline::CreatePipelineError::WorkGraphRequiresPassthroughModule);
+        };
+
+        let late_sized_buffer_groups =
+            Device::make_late_sized_buffer_groups(&FastHashMap::default(), &pipeline_layout);
+
+        let pipeline_desc = hal::WorkGraphPipelineDescriptor {
+            label: desc.label.to_hal(self.instance_flags),
+            layout: pipeline_layout.raw()?,
+            module: raw_module.as_ref(),
+            program_name: &desc.program_name,
+            entrypoints: &desc.entrypoints,
+            include_all_available_nodes: desc.include_all_available_nodes,
+        };
+
+        let (raw, info) = unsafe { self.raw().create_work_graph_pipeline(&pipeline_desc) }
+            .map_err(|error| self.handle_hal_pipeline_error(error))?;
+
+        let pipeline = pipeline::WorkGraphPipeline {
+            state: ResourceState::Valid(pipeline::WorkGraphPipelineState {
+                raw: ManuallyDrop::new(raw),
+                layout: pipeline_layout.clone(),
+                _shader_module: module.clone(),
+            }),
+            device: self.clone(),
+            late_sized_buffer_groups,
+            memory_requirements: info.memory_requirements,
+            entrypoints: info.entrypoints,
+            label: desc.label.to_string(),
+            tracking_data: TrackingData::new(self.tracker_indices.work_graph_pipelines.clone()),
+        };
+
+        Ok(Arc::new(pipeline))
     }
 
     /// Creates a render pipeline. If the creation fails,

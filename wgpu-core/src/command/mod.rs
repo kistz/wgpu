@@ -2055,6 +2055,10 @@ pub enum PassErrorScope {
     ExecuteBundle,
     #[error("In a dispatch command, indirect:{indirect}")]
     Dispatch { indirect: bool },
+    #[error("In a set_work_graph_pipeline command")]
+    SetPipelineWorkGraph,
+    #[error("In a dispatch_graph command")]
+    DispatchGraph,
     #[error("In a push_debug_group command")]
     PushDebugGroup,
     #[error("In a pop_debug_group command")]

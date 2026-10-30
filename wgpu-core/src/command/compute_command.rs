@@ -19,6 +19,14 @@ pub enum ComputeCommand<R: ReferenceType> {
 
     SetPipeline(R::ComputePipeline),
 
+    /// Set a work graph pipeline and the buffer region holding its backing memory.
+    SetWorkGraphPipeline {
+        pipeline: R::WorkGraphPipeline,
+        backing_memory: R::Buffer,
+        offset: wgt::BufferAddress,
+        size: Option<wgt::BufferAddress>,
+    },
+
     /// Set a range of immediates to values stored in `immediates_data`.
     SetImmediate {
         /// The byte offset within the immediate data storage to write to. This
@@ -34,6 +42,10 @@ pub enum ComputeCommand<R: ReferenceType> {
     DispatchWorkgroupsIndirect {
         buffer: R::Buffer,
         offset: wgt::BufferAddress,
+    },
+
+    DispatchGraph {
+        inputs: Vec<wgt::WorkGraphNodeInput<Vec<u8>>>,
     },
 
     PushDebugGroup {

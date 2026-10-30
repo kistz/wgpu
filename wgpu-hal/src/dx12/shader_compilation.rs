@@ -128,9 +128,35 @@ impl CompilerContainer {
                 device,
                 source,
                 source_name,
-                raw_ep,
+                Some(raw_ep),
                 stage_bit,
                 full_stage,
+                compiler,
+            ),
+        }
+    }
+
+    /// Compiles a shader library, such as the nodes of a work graph, for the `lib_*` `target`.
+    pub(super) fn compile_library(
+        &self,
+        device: &super::Device,
+        source: &str,
+        source_name: Option<&CStr>,
+        target: &str,
+    ) -> Result<super::CompiledShader, crate::PipelineError> {
+        match self {
+            CompilerContainer::Fxc(..) => Err(crate::PipelineError::Linkage(
+                wgt::ShaderStages::COMPUTE,
+                String::from("Shader libraries can only be compiled with DXC"),
+            )),
+            CompilerContainer::DynamicDxc(CompilerDynamicDxc { compiler, .. })
+            | CompilerContainer::StaticDxc(CompilerStaticDxc { compiler, .. }) => compile_dxc(
+                device,
+                source,
+                source_name,
+                None,
+                wgt::ShaderStages::COMPUTE,
+                target,
                 compiler,
             ),
         }
@@ -366,7 +392,7 @@ fn compile_dxc(
     device: &crate::dx12::Device,
     source: &str,
     source_name: Option<&CStr>,
-    raw_ep: &str,
+    raw_ep: Option<&str>,
     stage_bit: wgt::ShaderStages,
     full_stage: &str,
     compiler: &Dxc::IDxcCompiler3,
@@ -377,7 +403,7 @@ fn compile_dxc(
         .and_then(|cstr| cstr.to_str().ok())
         .and_then(sanitize_source_name);
     let source_name = source_name.as_deref().map(OPCWSTR::new);
-    let raw_ep = OPCWSTR::new(raw_ep);
+    let raw_ep = raw_ep.map(OPCWSTR::new);
     let full_stage = OPCWSTR::new(full_stage);
 
     let mut compile_args = arrayvec::ArrayVec::<PCWSTR, 13>::new_const();
@@ -386,13 +412,19 @@ fn compile_dxc(
         compile_args.push(source_name.ptr())
     }
 
+    // Libraries have no entry point and use DXC's default HLSL version.
+    if let Some(raw_ep) = raw_ep.as_ref() {
+        compile_args.extend([
+            windows::core::w!("-E"),
+            raw_ep.ptr(),
+            windows::core::w!("-HV"),
+            windows::core::w!("2018"), // Use HLSL 2018, Naga doesn't supported 2021 yet.
+        ]);
+    }
+
     compile_args.extend([
-        windows::core::w!("-E"),
-        raw_ep.ptr(),
         windows::core::w!("-T"),
         full_stage.ptr(),
-        windows::core::w!("-HV"),
-        windows::core::w!("2018"), // Use HLSL 2018, Naga doesn't supported 2021 yet.
         windows::core::w!("-no-warnings"),
         Dxc::DXC_ARG_ENABLE_STRICTNESS,
     ]);

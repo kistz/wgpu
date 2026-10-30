@@ -51,6 +51,7 @@ mod surface_texture;
 mod texture;
 mod texture_view;
 mod tlas;
+mod work_graph_pipeline;
 
 pub use adapter::*;
 pub use bind_group::*;
@@ -81,6 +82,7 @@ pub use surface_texture::*;
 pub use texture::*;
 pub use texture_view::*;
 pub use tlas::*;
+pub use work_graph_pipeline::*;
 
 /// Object debugging label.
 pub type Label<'a> = Option<&'a str>;

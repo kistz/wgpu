@@ -59,6 +59,7 @@ impl crate::Api for Api {
     type ShaderModule = Resource;
     type RenderPipeline = Resource;
     type RayTracingPipeline = Resource;
+    type WorkGraphPipeline = Resource;
     type ComputePipeline = Resource;
 }
 
@@ -76,6 +77,7 @@ impl crate::DynPipelineLayout for Resource {}
 impl crate::DynQuerySet for Resource {}
 impl crate::DynRenderPipeline for Resource {}
 impl crate::DynRayTracingPipeline for Resource {}
+impl crate::DynWorkGraphPipeline for Resource {}
 impl crate::DynSampler for Resource {}
 impl crate::DynShaderModule for Resource {}
 impl crate::DynSurfaceTexture for Resource {}
@@ -410,6 +412,30 @@ impl crate::Device for Context {
     ) -> Result<Vec<u8>, crate::DeviceError> {
         Ok(vec![0; groups.count()])
     }
+    // Reports fixed values so that wgpu-core validation can be tested.
+    unsafe fn create_work_graph_pipeline(
+        &self,
+        desc: &crate::WorkGraphPipelineDescriptor<Resource, Resource>,
+    ) -> Result<(Resource, crate::WorkGraphPipelineInfo), crate::PipelineError> {
+        let info = crate::WorkGraphPipelineInfo {
+            memory_requirements: wgt::WorkGraphMemoryRequirements {
+                min_size: 256,
+                max_size: 1024,
+                size_granularity: 256,
+            },
+            entrypoints: desc
+                .entrypoints
+                .iter()
+                .map(|node| wgt::WorkGraphEntrypoint {
+                    node: node.clone().into_owned(),
+                    record_size: 16,
+                    record_alignment: 4,
+                })
+                .collect(),
+        };
+        Ok((Resource, info))
+    }
+    unsafe fn destroy_work_graph_pipeline(&self, pipeline: Resource) {}
     unsafe fn create_pipeline_cache(
         &self,
         desc: &crate::PipelineCacheDescriptor<'_>,

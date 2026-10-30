@@ -2621,6 +2621,18 @@ impl crate::Device for super::Device {
         .map_err(super::map_host_device_oom_err)
     }
 
+    unsafe fn create_work_graph_pipeline(
+        &self,
+        _desc: &crate::WorkGraphPipelineDescriptor<super::PipelineLayout, super::ShaderModule>,
+    ) -> Result<(super::WorkGraphPipeline, crate::WorkGraphPipelineInfo), crate::PipelineError>
+    {
+        unimplemented!("Work graphs are unsupported on Vulkan")
+    }
+
+    unsafe fn destroy_work_graph_pipeline(&self, _pipeline: super::WorkGraphPipeline) {
+        unimplemented!("Work graphs are unsupported on Vulkan")
+    }
+
     unsafe fn create_pipeline_cache(
         &self,
         desc: &crate::PipelineCacheDescriptor<'_>,

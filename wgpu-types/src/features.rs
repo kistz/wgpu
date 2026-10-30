@@ -684,7 +684,21 @@ features! {
         #[name("wgpu-ray-tracing-pipelines")]
         const EXPERIMENTAL_RAY_TRACING_PIPELINES = 1 << 24;
 
-        // Bit 25 is available.
+        /// ***THIS IS EXPERIMENTAL:*** Features enabled by this may have
+        /// major bugs in them and are expected to be subject to breaking changes.
+        ///
+        /// Allows creating work graph pipelines from passthrough DXIL or HLSL shader libraries,
+        /// and dispatching them in a compute pass.
+        ///
+        /// Work graph shaders can only be supplied as passthrough shaders, so this also
+        /// requires [`Features::PASSTHROUGH_SHADERS`].
+        ///
+        /// Supported platforms:
+        /// - DX12 (work graphs tier 1.0 and shader model 6.8)
+        ///
+        /// This is a native only feature.
+        #[name("wgpu-work-graphs")]
+        const EXPERIMENTAL_WORK_GRAPHS = 1 << 25;
 
         /// Enables multiview render passes and `builtin(view_index)` in vertex/mesh shaders.
         ///
@@ -1571,7 +1585,8 @@ impl Features {
                     | FeaturesWGPU::EXPERIMENTAL_RAY_QUERY.bits()
                     | FeaturesWGPU::EXPERIMENTAL_RAY_HIT_VERTEX_RETURN.bits()
                     | FeaturesWGPU::EXPERIMENTAL_COOPERATIVE_MATRIX.bits()
-                    | FeaturesWGPU::EXPERIMENTAL_RAY_TRACING_PIPELINES.bits(),
+                    | FeaturesWGPU::EXPERIMENTAL_RAY_TRACING_PIPELINES.bits()
+                    | FeaturesWGPU::EXPERIMENTAL_WORK_GRAPHS.bits(),
             ),
             FeaturesWebGPU::empty(),
         )

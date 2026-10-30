@@ -56,6 +56,7 @@ mod texture;
 mod tokens;
 mod transfers;
 mod vertex;
+mod work_graph;
 mod write_only;
 
 pub use nt::VertexFormat;
@@ -81,6 +82,7 @@ pub use texture::*;
 pub use tokens::*;
 pub use transfers::*;
 pub use vertex::*;
+pub use work_graph::*;
 pub use write_only::*;
 
 pub(crate) use bitflags_array::*;

@@ -8,13 +8,14 @@ use crate::{
     PipelineCacheError, PipelineError, PipelineLayoutDescriptor, RayObjectIntersectionState,
     RayTracingPipelineDescriptor, RenderPipelineDescriptor, SamplerDescriptor, ShaderError,
     ShaderInput, ShaderModuleDescriptor, TextureDescriptor, TextureViewDescriptor, TlasInstance,
+    WorkGraphPipelineDescriptor, WorkGraphPipelineInfo,
 };
 
 use super::{
     DynAccelerationStructure, DynBindGroup, DynBindGroupLayout, DynBuffer, DynCommandEncoder,
     DynComputePipeline, DynFence, DynPipelineCache, DynPipelineLayout, DynQuerySet, DynQueue,
     DynRayTracingPipeline, DynRenderPipeline, DynResource, DynResourceExt as _, DynSampler,
-    DynShaderModule, DynTexture, DynTextureView,
+    DynShaderModule, DynTexture, DynTextureView, DynWorkGraphPipeline,
 };
 
 pub trait DynDevice: DynResource {
@@ -126,6 +127,12 @@ pub trait DynDevice: DynResource {
         pipeline: &dyn DynRayTracingPipeline,
         groups: core::ops::Range<u32>,
     ) -> Result<Vec<u8>, DeviceError>;
+
+    unsafe fn create_work_graph_pipeline(
+        &self,
+        desc: &WorkGraphPipelineDescriptor<dyn DynPipelineLayout, dyn DynShaderModule>,
+    ) -> Result<(Box<dyn DynWorkGraphPipeline>, WorkGraphPipelineInfo), PipelineError>;
+    unsafe fn destroy_work_graph_pipeline(&self, pipeline: Box<dyn DynWorkGraphPipeline>);
 
     unsafe fn create_pipeline_cache(
         &self,
@@ -505,6 +512,28 @@ impl<D: Device + DynResource> DynDevice for D {
         unsafe {
             D::get_raytracing_pipeline_group_data(self, pipeline.expect_downcast_ref(), groups)
         }
+    }
+
+    unsafe fn create_work_graph_pipeline(
+        &self,
+        desc: &WorkGraphPipelineDescriptor<dyn DynPipelineLayout, dyn DynShaderModule>,
+    ) -> Result<(Box<dyn DynWorkGraphPipeline>, WorkGraphPipelineInfo), PipelineError> {
+        let desc = WorkGraphPipelineDescriptor {
+            label: desc.label,
+            layout: desc.layout.expect_downcast_ref(),
+            module: desc.module.expect_downcast_ref(),
+            program_name: desc.program_name,
+            entrypoints: desc.entrypoints,
+            include_all_available_nodes: desc.include_all_available_nodes,
+        };
+
+        unsafe { D::create_work_graph_pipeline(self, &desc) }.map(
+            |(pipeline, info)| -> (Box<dyn DynWorkGraphPipeline>, _) { (Box::new(pipeline), info) },
+        )
+    }
+
+    unsafe fn destroy_work_graph_pipeline(&self, pipeline: Box<dyn DynWorkGraphPipeline>) {
+        unsafe { D::destroy_work_graph_pipeline(self, pipeline.unbox()) };
     }
 
     unsafe fn create_pipeline_cache(

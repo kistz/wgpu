@@ -6,3 +6,4 @@ pub mod cooperative_matrices;
 pub mod debug_printf;
 pub mod mesh_shading;
 pub mod ray_tracing;
+pub mod work_graphs;

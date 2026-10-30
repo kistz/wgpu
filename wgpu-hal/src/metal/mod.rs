@@ -88,6 +88,7 @@ impl crate::Api for Api {
     type ShaderModule = ShaderModule;
     type RenderPipeline = RenderPipeline;
     type RayTracingPipeline = RayTracingPipeline;
+    type WorkGraphPipeline = WorkGraphPipeline;
     type ComputePipeline = ComputePipeline;
     type PipelineCache = PipelineCache;
 
@@ -112,6 +113,7 @@ crate::impl_dyn_resource!(
     Queue,
     RenderPipeline,
     RayTracingPipeline,
+    WorkGraphPipeline,
     Sampler,
     ShaderModule,
     Surface,
@@ -1248,6 +1250,11 @@ impl crate::DynComputePipeline for ComputePipeline {}
 pub struct RayTracingPipeline {}
 
 impl crate::DynRayTracingPipeline for RayTracingPipeline {}
+
+#[derive(Debug)]
+pub struct WorkGraphPipeline {}
+
+impl crate::DynWorkGraphPipeline for WorkGraphPipeline {}
 
 #[derive(Debug, Clone)]
 pub struct QuerySet {

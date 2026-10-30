@@ -54,6 +54,10 @@ pub struct Player {
         wgc::id::PointerId<wgc::id::markers::ComputePipeline>,
         Arc<wgc::pipeline::ComputePipeline>,
     >,
+    work_graph_pipelines: HashMap<
+        wgc::id::PointerId<wgc::id::markers::WorkGraphPipeline>,
+        Arc<wgc::pipeline::WorkGraphPipeline>,
+    >,
     pipeline_caches: HashMap<
         wgc::id::PointerId<wgc::id::markers::PipelineCache>,
         Arc<wgc::pipeline::PipelineCache>,
@@ -83,6 +87,7 @@ impl Default for Player {
             render_bundles: HashMap::new(),
             render_pipelines: HashMap::new(),
             compute_pipelines: HashMap::new(),
+            work_graph_pipelines: HashMap::new(),
             pipeline_caches: HashMap::new(),
             query_sets: HashMap::new(),
             buffers: HashMap::new(),
@@ -327,6 +332,23 @@ impl Player {
                 self.compute_pipelines
                     .remove(&id)
                     .expect("invalid compute pipeline");
+            }
+            Action::CreateWorkGraphPipeline { id, desc } => {
+                let resolved_desc = wgc::pipeline::WorkGraphPipelineDescriptor {
+                    label: desc.label,
+                    layout: self.resolve_pipeline_layout_id(desc.layout),
+                    module: self.resolve_shader_module_id(desc.module),
+                    program_name: desc.program_name,
+                    entrypoints: desc.entrypoints,
+                    include_all_available_nodes: desc.include_all_available_nodes,
+                };
+                let pipeline = device.create_work_graph_pipeline(resolved_desc);
+                self.work_graph_pipelines.insert(id, pipeline);
+            }
+            Action::DropWorkGraphPipeline(id) => {
+                self.work_graph_pipelines
+                    .remove(&id)
+                    .expect("invalid work graph pipeline");
             }
             Action::CreateGeneralRenderPipeline { id, desc } => {
                 // Note that this is the `General` version of the render
@@ -1012,12 +1034,28 @@ impl Player {
                 bind_group: bind_group.map(|bg| self.resolve_bind_group_id(bg)),
             },
             C::SetPipeline(id) => C::SetPipeline(self.resolve_compute_pipeline_id(id)),
+            C::SetWorkGraphPipeline {
+                pipeline,
+                backing_memory,
+                offset,
+                size,
+            } => C::SetWorkGraphPipeline {
+                pipeline: self
+                    .work_graph_pipelines
+                    .get(&pipeline)
+                    .expect("invalid work graph pipeline")
+                    .clone(),
+                backing_memory: self.resolve_buffer_id(backing_memory),
+                offset,
+                size,
+            },
             C::SetImmediate { offset, data } => C::SetImmediate { offset, data },
             C::DispatchWorkgroups(groups) => C::DispatchWorkgroups(groups),
             C::DispatchWorkgroupsIndirect { buffer, offset } => C::DispatchWorkgroupsIndirect {
                 buffer: self.resolve_buffer_id(buffer),
                 offset,
             },
+            C::DispatchGraph { inputs } => C::DispatchGraph { inputs },
             C::PushDebugGroup { color, len } => C::PushDebugGroup { color, len },
             C::PopDebugGroup => C::PopDebugGroup,
             C::InsertDebugMarker { color, len } => C::InsertDebugMarker { color, len },

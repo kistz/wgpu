@@ -15,6 +15,7 @@ impl wgpu_core::command::ReferenceType for IdReferences {
     type RenderPipeline = RenderPipelineId;
     type RenderBundle = RenderBundleId;
     type ComputePipeline = ComputePipelineId;
+    type WorkGraphPipeline = core::convert::Infallible;
     type Blas = BlasId;
     type Tlas = TlasId;
 }

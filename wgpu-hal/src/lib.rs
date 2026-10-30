@@ -290,7 +290,7 @@ pub use dynamic::{
     DynDevice, DynExposedAdapter, DynFence, DynInstance, DynOpenDevice, DynPipelineCache,
     DynPipelineLayout, DynQuerySet, DynQueue, DynRayTracingPipeline, DynRenderPipeline,
     DynResource, DynSampler, DynShaderModule, DynSurface, DynSurfaceTexture, DynTexture,
-    DynTextureView,
+    DynTextureView, DynWorkGraphPipeline,
 };
 
 #[allow(unused)]
@@ -555,6 +555,8 @@ pub enum PipelineError {
     Device(#[from] DeviceError),
     #[error("Pipeline constant error for stage {0:?}: {1}")]
     PipelineConstants(wgt::ShaderStages, String),
+    #[error("Work graph creation failed: {0}")]
+    WorkGraph(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -686,6 +688,7 @@ pub trait Api: Clone + fmt::Debug + Sized + WasmNotSendSync + 'static {
     type RenderPipeline: DynRenderPipeline;
     type ComputePipeline: DynComputePipeline;
     type RayTracingPipeline: DynRayTracingPipeline;
+    type WorkGraphPipeline: DynWorkGraphPipeline;
     type PipelineCache: DynPipelineCache;
 
     type AccelerationStructure: DynAccelerationStructure + 'static;
@@ -1175,6 +1178,23 @@ pub trait Device: WasmNotSendSync {
         pipeline: &<Self::A as Api>::RayTracingPipeline,
         groups: Range<u32>,
     ) -> Result<Vec<u8>, DeviceError>;
+
+    /// Create a work graph pipeline according to `desc`.
+    ///
+    /// Returns the pipeline together with its entrypoints and backing memory
+    /// requirements.
+    ///
+    /// The returned pipeline's lifetime is independent of that of
+    /// `desc.layout` and `desc.module`.
+    #[allow(clippy::type_complexity)]
+    unsafe fn create_work_graph_pipeline(
+        &self,
+        desc: &WorkGraphPipelineDescriptor<
+            <Self::A as Api>::PipelineLayout,
+            <Self::A as Api>::ShaderModule,
+        >,
+    ) -> Result<(<Self::A as Api>::WorkGraphPipeline, WorkGraphPipelineInfo), PipelineError>;
+    unsafe fn destroy_work_graph_pipeline(&self, pipeline: <Self::A as Api>::WorkGraphPipeline);
 
     unsafe fn create_pipeline_cache(
         &self,
@@ -1882,6 +1902,40 @@ pub trait CommandEncoder: WasmNotSendSync + fmt::Debug {
         buffer: &<Self::A as Api>::Buffer,
         offset: wgt::BufferAddress,
     );
+
+    /// Set the work graph pipeline used by subsequent calls to [`dispatch_graph`].
+    ///
+    /// This replaces any compute pipeline set by [`set_compute_pipeline`].
+    ///
+    /// # Safety
+    ///
+    /// - There must be an active compute pass.
+    /// - Pipeline must not be destroyed.
+    ///
+    /// [`dispatch_graph`]: CommandEncoder::dispatch_graph
+    /// [`set_compute_pipeline`]: CommandEncoder::set_compute_pipeline
+    unsafe fn set_work_graph_pipeline(&mut self, pipeline: &<Self::A as Api>::WorkGraphPipeline);
+
+    /// Submit input records to the current work graph pipeline.
+    ///
+    /// # Safety
+    ///
+    /// - A work graph pipeline must have been set with [`set_work_graph_pipeline`]
+    ///   since the last call to [`set_compute_pipeline`] in this pass.
+    /// - The backing memory must be in the [`wgt::BufferUses::WORK_GRAPH_BACKING_MEMORY`] state,
+    ///   its offset must be a multiple of [`wgt::WORK_GRAPH_BACKING_MEMORY_ALIGNMENT`],
+    ///   and its size must be at least the pipeline's minimum backing memory size.
+    /// - `desc.initialize` must be `true` unless the backing memory was last used by a
+    ///   previous call to this function with the same pipeline and backing memory in this pass.
+    /// - The backing memory must not be used by work that may execute concurrently on another queue.
+    /// - Every input must refer to an entrypoint of the pipeline and provide
+    ///   enough correctly strided record data for its records.
+    /// - The input records must not violate any limits declared by the receiving nodes, such as
+    ///   `SV_DispatchGrid` exceeding `NodeMaxDispatchGrid`.
+    ///
+    /// [`set_work_graph_pipeline`]: CommandEncoder::set_work_graph_pipeline
+    /// [`set_compute_pipeline`]: CommandEncoder::set_compute_pipeline
+    unsafe fn dispatch_graph(&mut self, desc: &DispatchGraphDescriptor<<Self::A as Api>::Buffer>);
 
     /// Begin a new ray tracing pass, clearing all active bindings.
     ///
@@ -2701,6 +2755,34 @@ pub struct ComputePipelineDescriptor<
     pub cache: Option<&'a Pc>,
 }
 
+/// Describes a work graph pipeline.
+#[derive(Clone, Debug)]
+pub struct WorkGraphPipelineDescriptor<
+    'a,
+    Pl: DynPipelineLayout + ?Sized,
+    M: DynShaderModule + ?Sized,
+> {
+    pub label: Label<'a>,
+    /// The layout of bind groups for this pipeline. This is the work graph's global root signature.
+    pub layout: &'a Pl,
+    /// A shader library containing the nodes of the work graph.
+    pub module: &'a M,
+    /// Name of the work graph program in the library.
+    pub program_name: &'a str,
+    /// Nodes that are entrypoints in addition to the ones declared in the shaders.
+    pub entrypoints: &'a [wgt::WorkGraphNodeId<'a>],
+    /// Add all nodes in the library to the work graph.
+    pub include_all_available_nodes: bool,
+}
+
+/// Properties of a work graph pipeline that are known after its creation.
+#[derive(Clone, Debug, Default)]
+pub struct WorkGraphPipelineInfo {
+    pub memory_requirements: wgt::WorkGraphMemoryRequirements,
+    /// The entrypoints of the work graph, in entrypoint index order.
+    pub entrypoints: Vec<wgt::WorkGraphEntrypoint>,
+}
+
 #[derive(Debug)]
 pub struct PipelineCacheDescriptor<'a> {
     pub label: Label<'a>,
@@ -3228,6 +3310,22 @@ pub struct Telemetry {
         driver_version: Result<[u16; 4], windows_core::HRESULT>,
         result: D3D12ExposeAdapterResult,
     ),
+}
+
+#[derive(Debug)]
+pub struct WorkGraphBackingMemory<'a, B: DynBuffer + ?Sized> {
+    pub buffer: &'a B,
+    pub offset: wgt::BufferAddress,
+    pub size: wgt::BufferAddress,
+}
+
+#[derive(Debug)]
+pub struct DispatchGraphDescriptor<'a, B: DynBuffer + ?Sized> {
+    pub backing_memory: WorkGraphBackingMemory<'a, B>,
+    /// Initialize the backing memory before dispatching.
+    pub initialize: bool,
+    /// Input records for one or more entrypoints.
+    pub inputs: &'a [wgt::WorkGraphNodeInput<&'a [u8]>],
 }
 
 #[derive(Debug)]

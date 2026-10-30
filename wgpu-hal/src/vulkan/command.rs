@@ -1408,6 +1408,14 @@ impl crate::CommandEncoder for super::CommandEncoder {
 
     // ray tracing
 
+    unsafe fn set_work_graph_pipeline(&mut self, _pipeline: &super::WorkGraphPipeline) {
+        unimplemented!()
+    }
+
+    unsafe fn dispatch_graph(&mut self, _desc: &crate::DispatchGraphDescriptor<super::Buffer>) {
+        unimplemented!()
+    }
+
     unsafe fn begin_ray_tracing_pass(&mut self, desc: &crate::RayTracingPassDescriptor<'_>) {
         self.bind_point = vk::PipelineBindPoint::RAY_TRACING_KHR;
         if let Some(label) = desc.label {

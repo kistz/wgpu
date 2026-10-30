@@ -109,6 +109,7 @@ pub trait DynRenderPipeline: DynResource + fmt::Debug {}
 pub trait DynRayTracingPipeline: DynResource + fmt::Debug {}
 pub trait DynSampler: DynResource + fmt::Debug {}
 pub trait DynShaderModule: DynResource + fmt::Debug {}
+pub trait DynWorkGraphPipeline: DynResource + fmt::Debug {}
 pub trait DynSurfaceTexture:
     DynResource + core::borrow::Borrow<dyn DynTexture> + fmt::Debug
 {

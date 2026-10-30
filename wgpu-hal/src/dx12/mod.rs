@@ -373,6 +373,7 @@ impl crate::Api for Api {
     type RenderPipeline = RenderPipeline;
     type ComputePipeline = ComputePipeline;
     type RayTracingPipeline = RayTracingPipeline;
+    type WorkGraphPipeline = WorkGraphPipeline;
     type PipelineCache = PipelineCache;
 
     type AccelerationStructure = AccelerationStructure;
@@ -396,6 +397,7 @@ crate::impl_dyn_resource!(
     Queue,
     RayTracingPipeline,
     RenderPipeline,
+    WorkGraphPipeline,
     Sampler,
     ShaderModule,
     Surface,
@@ -841,6 +843,12 @@ struct PassState {
     vertex_buffers: [Direct3D12::D3D12_VERTEX_BUFFER_VIEW; crate::MAX_VERTEX_BUFFERS],
     dirty_vertex_buffers: usize,
     kind: PassKind,
+    work_graph: Option<Direct3D12::D3D12_PROGRAM_IDENTIFIER>,
+    /// The program identifier and backing memory of the last `SetProgram` call.
+    bound_work_graph: Option<(
+        Direct3D12::D3D12_PROGRAM_IDENTIFIER,
+        Direct3D12::D3D12_GPU_VIRTUAL_ADDRESS_RANGE,
+    )>,
 }
 
 // `root_elements` size must match `dirty_root_elements` bit size
@@ -865,6 +873,8 @@ impl PassState {
             vertex_buffers: [Default::default(); crate::MAX_VERTEX_BUFFERS],
             dirty_vertex_buffers: 0,
             kind: PassKind::Transfer,
+            work_graph: None,
+            bound_work_graph: None,
         }
     }
 
@@ -1309,6 +1319,18 @@ unsafe impl Sync for ComputePipeline {}
 pub struct RayTracingPipeline {}
 
 impl crate::DynRayTracingPipeline for RayTracingPipeline {}
+
+#[derive(Debug)]
+pub struct WorkGraphPipeline {
+    _raw: Direct3D12::ID3D12StateObject,
+    program_identifier: Direct3D12::D3D12_PROGRAM_IDENTIFIER,
+    layout: PipelineLayoutShared,
+}
+
+impl crate::DynWorkGraphPipeline for WorkGraphPipeline {}
+
+unsafe impl Send for WorkGraphPipeline {}
+unsafe impl Sync for WorkGraphPipeline {}
 
 #[derive(Debug)]
 pub struct PipelineCache;
