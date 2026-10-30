@@ -81,6 +81,7 @@ fn all_tests() -> Vec<wgpu_test::GpuTestInitializer> {
         timestamp_queries::tests::TIMESTAMPS_PASSES,
         timestamp_queries::tests::TIMESTAMPS_PASS_BOUNDARIES,
         water::TEST,
+        work_graphs::TEST,
     ];
 
     #[cfg(not(wasm_test))]

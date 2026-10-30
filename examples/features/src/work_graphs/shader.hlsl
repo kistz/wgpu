@@ -1,219 +1,241 @@
-// FILE BORROWED: All Rights remain to the original authors. https://github.com/GPUOpen-LibrariesAndSDKs/WorkGraphPlayground
+// A work graph that draws a Koch snowflake and a Sierpinski carpet into `Canvas`.
+// Lines and squares are split further the closer they are to `Focus`.
 
-// This file is part of the AMD & HSC Work Graph Playground.
-//
-// Copyright (C) 2025 Advanced Micro Devices, Inc. and Coburg University of Applied Sciences and Arts.
-// All rights reserved.
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files(the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and /or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions :
-//
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-// THE SOFTWARE.
+RWTexture2D<unorm float4> Canvas : register(u0);
 
-#include "Common.h"
+cbuffer Scene : register(b0)
+{
+    float2 Focus;
+    float FocusRadius;
+};
+
+#define FILL_GROUP_SIZE 8
+#define MAX_FILL_GRID 32
+
+static const float PI = 3.14159265;
+static const uint SNOWFLAKE = 0;
+
+struct Fractal
+{
+    float2 center;
+    float radius;
+    float rotation;
+    uint kind;
+};
 
 struct Line
 {
-    float2 a, b;
+    float2 a;
+    float2 b;
 };
 
-// [Task 2 Solution]:
-struct Box
+struct Square
 {
-    float2 topLeft;
-    float size;
+    float2 center;
+    float halfSize;
+    float rotation;
 };
 
-[Shader("node")]
-    [NodeIsProgramEntry]
-    [NodeLaunch("thread")]
-    [NodeId("Entry")] void EntryNode(
-        [MaxRecords(3)]
-            [NodeId("Snowflake")] NodeOutput<Line>
-                snowflakeOutput,
-
-        // [Task 2 Solution]: Single record output to the "Sponge" node.
-        [MaxRecords(1)]
-            [NodeId("Sponge")] NodeOutput<Box>
-                spongeOutput)
+struct FillRecord
 {
-    const bool stackVertical = RenderSize.x > RenderSize.y;
-    const float scale = stackVertical ? min(RenderSize.x * .225, RenderSize.y * .45) : min(RenderSize.x * .45, RenderSize.y * .225);
-    // Draw Snowflake fractal.
-    {
-        const float2 snowflakeCenter = RenderSize * (stackVertical ? float2(.25, .5) : float2(.5, .25));
+    uint2 grid : SV_DispatchGrid;
+    float2 center;
+    float halfSize;
+    float rotation;
+};
 
-        // Request three output records for the three sides of the initial equilateral triangle.
-        ThreadNodeOutputRecords<Line> outputRecords =
-            snowflakeOutput.GetThreadNodeOutputRecords(3);
-
-        // Compute three vertices of the initial equilateral triangle.
-        const float2 v0 = snowflakeCenter + scale * float2(0., -1.);
-        const float2 v1 = snowflakeCenter + scale * float2(-sqrt(3) * .5, .5);
-        const float2 v2 = snowflakeCenter + scale * float2(+sqrt(3) * .5, .5);
-
-        // Create the initial equilateral triangle.
-        outputRecords.Get(0).a = v0;
-        outputRecords.Get(0).b = v1;
-
-        outputRecords.Get(1).a = v1;
-        outputRecords.Get(2).a = v2;
-
-        outputRecords.Get(2).b = v0;
-        outputRecords.Get(1).b = v2;
-
-        outputRecords.OutputComplete();
-    }
-
-    // Draw Sponge fractal.
-    {
-        const float2 spongeCenter = RenderSize * (stackVertical ? float2(.75, .5) : float2(.5, .75));
-
-        // [Solution 2]: Request a single record for the "Sponge" node and write the initial box
-        //               position and size to it.
-        ThreadNodeOutputRecords<Box> outputRecord = spongeOutput.GetThreadNodeOutputRecords(1);
-
-        outputRecord.Get().topLeft = spongeCenter - scale;
-        outputRecord.Get().size = 2 * scale;
-
-        outputRecord.OutputComplete();
-    }
+// 1 at `Focus`, falling to 0 at `FocusRadius`.
+float Detail(float2 position)
+{
+    return 1 - smoothstep(0, FocusRadius, distance(position, Focus));
 }
 
-    [Shader("node")]
-    [NodeLaunch("thread")]
-    // If a node declares a recursive output to itself (see "recursiveOutput" below),
-    // a "[NodeMaxRecursionDepth(...)]" is required to specify the maximum number of recursion levels.
-    // This is required, as each recursion level counts towards the total graph depth,
-    // and the runtime has to ensure that this depth does not exceed the limit of 32 nodes.
-    // We can use "GetRemainingRecursionLevels()" in the node function to query the remaining
-    // recursion levels, i.e., determine whether we can still request recursive output records.
-    [NodeMaxRecursionDepth(4)]
-    [NodeId("Snowflake")] void SnowflakeNode(
-        ThreadNodeInputRecord<Line> inputRecord,
-
-        [MaxRecords(4)]
-            [NodeId("Snowflake")] NodeOutput<Line>
-                recursiveOutput)
+// Lines and squares are split until they are smaller than this, in pixels.
+float MinSize(float2 position)
 {
-    const float2 a = inputRecord.Get().a;
-    const float2 b = inputRecord.Get().b;
-
-    // Check if we have reached the recursion limit.
-    const bool hasOutput = GetRemainingRecursionLevels() != 0;
-
-    // Each recursion level has a 4x amplification factor, as each line
-    // splits into four new lines.
-    ThreadNodeOutputRecords<Line> outputRecords =
-        recursiveOutput.GetThreadNodeOutputRecords(hasOutput * 4);
-
-    if (hasOutput)
-    {
-        // Perpendicular vector to current line segment.
-        const float2 perp = float2(a.y - b.y, b.x - a.x) * sqrt(3) / 6;
-
-        // Compute vertices for the four new line segments:
-        //
-        //             v2
-        //            /  \
-        //           /    \
-        // v0 ---- v1      v3 ---- v4
-        const float2 v0 = a;
-        const float2 v1 = lerp(a, b, 1. / 3.);
-        const float2 v2 = lerp(a, b, .5) + perp;
-        const float2 v3 = lerp(a, b, 2. / 3.);
-        const float2 v4 = b;
-
-        outputRecords.Get(0).a = v0;
-        outputRecords.Get(0).b = v1;
-
-        outputRecords.Get(1).a = v1;
-        outputRecords.Get(1).b = v2;
-
-        outputRecords.Get(2).a = v2;
-        outputRecords.Get(2).b = v3;
-
-        outputRecords.Get(3).a = v3;
-        outputRecords.Get(3).b = v4;
-    }
-    else
-    {
-        // We've reached the recursion limit, thus we draw the current line segment
-        // to the output.
-        DrawLine(a, b);
-    }
-
-    outputRecords.OutputComplete();
+    return lerp(96, 5, Detail(position));
 }
 
-// [Task 2 Solution]:
-[Shader("node")]
-    [NodeLaunch("thread")]
-    [NodeMaxRecursionDepth(4)]
-    [NodeId("Sponge")] void
-    SpongeNode(
-        ThreadNodeInputRecord<Box> inputRecord,
-
-        [MaxRecords(8)]
-            [NodeId("Sponge")] NodeOutput<Box>
-                recursiveOutput)
+float4 Color(float2 position)
 {
-    const float2 topLeft = inputRecord.Get().topLeft;
-    const float size = inputRecord.Get().size;
+    const float t = 0.6 - 0.45 * Detail(position);
+    return float4(0.5 + 0.5 * cos(2 * PI * (t + float3(0.0, 0.33, 0.67))), 1);
+}
 
-    // Check if we have reached the recursion limit.
-    const bool hasOutput = GetRemainingRecursionLevels() != 0;
+float2x2 Rotation(float angle)
+{
+    const float s = sin(angle);
+    const float c = cos(angle);
+    return float2x2(c, -s, s, c);
+}
 
-    // Split each box into eight boxes:
-    // +---+---+---+
-    // | 0 | 1 | 2 |
-    // +---+---+---+
-    // | 3 |   | 4 |
-    // +---+---+---+
-    // | 5 | 6 | 7 |
-    // +---+---+---+
-    ThreadNodeOutputRecords<Box> outputRecords = recursiveOutput.GetThreadNodeOutputRecords(hasOutput * 8);
+float2 TriangleCorner(Fractal fractal, uint index)
+{
+    const float angle = fractal.rotation - index * 2 * PI / 3;
+    return fractal.center + fractal.radius * float2(sin(angle), -cos(angle));
+}
 
-    if (hasOutput)
+[Shader("node")]
+[NodeIsProgramEntry]
+[NodeLaunch("thread")]
+void Entry(
+    ThreadNodeInputRecord<Fractal> input,
+    [MaxRecords(3)] [NodeId("Snowflake")] NodeOutput<Line> snowflakeOutput,
+    [MaxRecords(1)] [NodeId("Carpet")] NodeOutput<Square> carpetOutput)
+{
+    const Fractal fractal = input.Get();
+    const bool isSnowflake = fractal.kind == SNOWFLAKE;
+
+    // Records must be requested and completed in thread group uniform control flow, so unused
+    // outputs request zero records.
+    ThreadNodeOutputRecords<Line> lines =
+        snowflakeOutput.GetThreadNodeOutputRecords(isSnowflake ? 3 : 0);
+    ThreadNodeOutputRecords<Square> squares =
+        carpetOutput.GetThreadNodeOutputRecords(isSnowflake ? 0 : 1);
+
+    if (isSnowflake)
     {
-        const float newSize = size / 3.;
-
-        uint outputRecordIndex = 0;
-
-        for (uint row = 0; row < 3; ++row)
+        for (uint i = 0; i < 3; ++i)
         {
-            for (uint col = 0; col < 3; ++col)
-            {
-                // Skip the center (see visualization above).
-                if (row == 1 && col == 1)
-                    continue;
-
-                outputRecords.Get(outputRecordIndex).size = newSize;
-                outputRecords.Get(outputRecordIndex).topLeft = topLeft + float2(col * newSize, row * newSize);
-
-                // Advance to next output record.
-                outputRecordIndex++;
-            }
+            lines.Get(i).a = TriangleCorner(fractal, i);
+            lines.Get(i).b = TriangleCorner(fractal, i + 1);
         }
     }
     else
     {
-        // We've reached the recursion limit, thus we draw the current box to the output.
-        FillRect(topLeft, topLeft + size);
+        squares.Get().center = fractal.center;
+        squares.Get().halfSize = fractal.radius * 0.75;
+        squares.Get().rotation = fractal.rotation;
     }
 
-    outputRecords.OutputComplete();
+    lines.OutputComplete();
+    squares.OutputComplete();
+}
+
+[Shader("node")]
+[NodeLaunch("thread")]
+[NodeMaxRecursionDepth(5)]
+void Snowflake(
+    ThreadNodeInputRecord<Line> input,
+    [MaxRecords(4)] [NodeId("Snowflake")] NodeOutput<Line> splitOutput,
+    [MaxRecords(1)] [NodeId("DrawLine")] NodeOutput<Line> drawOutput)
+{
+    const float2 a = input.Get().a;
+    const float2 b = input.Get().b;
+    const bool split = GetRemainingRecursionLevels() != 0 && distance(a, b) > MinSize((a + b) / 2);
+
+    ThreadNodeOutputRecords<Line> lines = splitOutput.GetThreadNodeOutputRecords(split ? 4 : 0);
+    ThreadNodeOutputRecords<Line> drawnLine = drawOutput.GetThreadNodeOutputRecords(split ? 0 : 1);
+
+    if (split)
+    {
+        // Replaces the middle third with the other two sides of an equilateral triangle.
+        const float2 normal = float2(a.y - b.y, b.x - a.x) * sqrt(3) / 6;
+        const float2 points[5] = { a, lerp(a, b, 1.0 / 3), (a + b) / 2 + normal, lerp(a, b, 2.0 / 3), b };
+        for (uint i = 0; i < 4; ++i)
+        {
+            lines.Get(i).a = points[i];
+            lines.Get(i).b = points[i + 1];
+        }
+    }
+    else
+    {
+        drawnLine.Get().a = a;
+        drawnLine.Get().b = b;
+    }
+
+    lines.OutputComplete();
+    drawnLine.OutputComplete();
+}
+
+// Draws up to 32 lines per thread group, one per thread.
+[Shader("node")]
+[NodeLaunch("coalescing")]
+[NumThreads(32, 1, 1)]
+void DrawLine(
+    [MaxRecords(32)] GroupNodeInputRecords<Line> lines,
+    uint thread : SV_GroupIndex)
+{
+    if (thread >= lines.Count())
+    {
+        return;
+    }
+
+    const float2 a = lines[thread].a;
+    const float2 b = lines[thread].b;
+    const uint steps = max(uint(ceil(max(abs(b.x - a.x), abs(b.y - a.y)))), 1);
+    for (uint i = 0; i <= steps; ++i)
+    {
+        const float2 position = lerp(a, b, float(i) / steps);
+        const float4 color = Color(position);
+        const int2 pixel = int2(floor(position));
+        Canvas[pixel] = color;
+        Canvas[pixel + int2(1, 0)] = color;
+        Canvas[pixel + int2(0, 1)] = color;
+        Canvas[pixel + int2(1, 1)] = color;
+    }
+}
+
+// Splits a square into 3x3 squares and leaves out the middle one. Each of the 8 threads either
+// splits its square further or fills it.
+[Shader("node")]
+[NodeLaunch("broadcasting")]
+[NodeDispatchGrid(1, 1, 1)]
+[NumThreads(8, 1, 1)]
+[NodeMaxRecursionDepth(4)]
+void Carpet(
+    DispatchNodeInputRecord<Square> input,
+    uint thread : SV_GroupIndex,
+    [MaxRecords(8)] [NodeId("Carpet")] NodeOutput<Square> splitOutput,
+    [MaxRecords(8)] [NodeId("FillSquare")] NodeOutput<FillRecord> fillOutput)
+{
+    const Square parent = input.Get();
+    const uint cell = thread < 4 ? thread : thread + 1;
+    const float2 offset = float2(int(cell % 3) - 1, int(cell / 3) - 1) * (2 * parent.halfSize / 3);
+    const float2 center = parent.center + mul(Rotation(parent.rotation), offset);
+    const float halfSize = parent.halfSize / 3;
+    const bool split = GetRemainingRecursionLevels() != 0 && 2 * halfSize > MinSize(center);
+
+    ThreadNodeOutputRecords<Square> square = splitOutput.GetThreadNodeOutputRecords(split ? 1 : 0);
+    ThreadNodeOutputRecords<FillRecord> fill = fillOutput.GetThreadNodeOutputRecords(split ? 0 : 1);
+
+    if (split)
+    {
+        square.Get().center = center;
+        square.Get().halfSize = halfSize;
+        square.Get().rotation = parent.rotation;
+    }
+    else
+    {
+        // Covers the bounding box of the rotated square with thread groups.
+        const float extent = halfSize * (abs(cos(parent.rotation)) + abs(sin(parent.rotation)));
+        const uint groups = min(uint(ceil((2 * extent + 2) / FILL_GROUP_SIZE)), MAX_FILL_GRID);
+        fill.Get().grid = uint2(groups, groups);
+        fill.Get().center = center;
+        fill.Get().halfSize = halfSize;
+        fill.Get().rotation = parent.rotation;
+    }
+
+    square.OutputComplete();
+    fill.OutputComplete();
+}
+
+// Fills a square with one thread per pixel. The size of the dispatch grid depends on the square.
+[Shader("node")]
+[NodeLaunch("broadcasting")]
+[NodeMaxDispatchGrid(MAX_FILL_GRID, MAX_FILL_GRID, 1)]
+[NumThreads(FILL_GROUP_SIZE, FILL_GROUP_SIZE, 1)]
+void FillSquare(
+    DispatchNodeInputRecord<FillRecord> input,
+    uint2 thread : SV_DispatchThreadID)
+{
+    const FillRecord square = input.Get();
+    const int2 pixel = int2(floor(square.center)) - int2(square.grid * FILL_GROUP_SIZE / 2) + int2(thread);
+    const float2 local = mul(float2(pixel) + 0.5 - square.center, Rotation(square.rotation));
+
+    // Leaves a gap between neighboring squares.
+    if (max(abs(local.x), abs(local.y)) < square.halfSize - 0.75)
+    {
+        Canvas[pixel] = Color(square.center);
+    }
 }
