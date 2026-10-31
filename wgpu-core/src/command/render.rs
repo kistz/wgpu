@@ -25,6 +25,9 @@ use crate::{
             QueryResetMap, QuerySetWrites,
         },
         render_command::ArcRenderCommand,
+        work_graph::{
+            validate_backing_memory, validate_cpu_inputs, WorkGraphError, WorkGraphState,
+        },
         ArcCommand, BasePass, BindGroupStateChange, CommandBufferTextureMemoryActions,
         CommandEncoder, CommandEncoderError, DebugGroupError, DrawCommandFamily, DrawError,
         DrawKind, EncoderStateError, EncodingState, ExecutionError, InnerCommandEncoder,
@@ -37,7 +40,7 @@ use crate::{
     },
     hal_label, id, impl_resource_type,
     init_tracker::{MemoryInitKind, TextureInitRange, TextureInitTrackerAction},
-    pipeline::{PipelineFlags, RenderPipeline, VertexStep},
+    pipeline::{PipelineFlags, RenderPipeline, VertexStep, WorkGraphPipeline},
     resource::{
         Buffer, DestroyedResourceError, InvalidOrDestroyedResourceError, InvalidResourceError,
         Labeled, MissingBufferUsageError, MissingTextureUsageError, ParentDevice, QuerySet,
@@ -656,6 +659,8 @@ struct State<'scope, 'snatch_guard, 'cmd_enc> {
     blend_constant: OptionalState,
     stencil_reference: u32,
     pipeline: Option<Arc<RenderPipeline>>,
+    /// The work graph pipeline, if one was set more recently than `pipeline`.
+    work_graph: Option<WorkGraphState>,
     index: IndexState,
     vertex: VertexState,
 
@@ -721,8 +726,11 @@ impl<'scope, 'snatch_guard, 'cmd_enc> State<'scope, 'snatch_guard, 'cmd_enc> {
     }
 
     fn flush_immediates(&mut self) {
-        let pipeline = self.pipeline.as_ref().unwrap();
-        let layout = pipeline.layout().unwrap();
+        let layout = match (&self.pipeline, &self.work_graph) {
+            (Some(pipeline), _) => pipeline.layout().unwrap(),
+            (None, Some(work_graph)) => work_graph.pipeline.layout().unwrap(),
+            (None, None) => unreachable!(),
+        };
         self.pass
             .immediate_state
             .flush_immediates(layout, self.pass.base.raw_encoder);
@@ -741,6 +749,7 @@ impl<'scope, 'snatch_guard, 'cmd_enc> State<'scope, 'snatch_guard, 'cmd_enc> {
     fn reset_bundle(&mut self) {
         self.pass.binder.reset();
         self.pipeline = None;
+        self.work_graph = None;
         self.index.reset();
         self.vertex = Default::default();
         self.pass.immediate_state.immediate_slots_set = Default::default();
@@ -979,6 +988,8 @@ pub enum RenderPassErrorInner {
     #[error(transparent)]
     Draw(#[from] DrawError),
     #[error(transparent)]
+    WorkGraph(#[from] WorkGraphError),
+    #[error(transparent)]
     Bind(#[from] BindError),
     #[error(transparent)]
     QueryUse(#[from] QueryUseError),
@@ -1070,6 +1081,7 @@ impl WebGpuError for RenderPassError {
             RenderPassErrorInner::MissingDownlevelFlags(e) => e.webgpu_error_type(),
             RenderPassErrorInner::RenderCommand(e) => e.webgpu_error_type(),
             RenderPassErrorInner::Draw(e) => e.webgpu_error_type(),
+            RenderPassErrorInner::WorkGraph(e) => e.webgpu_error_type(),
             RenderPassErrorInner::Bind(e) => e.webgpu_error_type(),
             RenderPassErrorInner::QueryUse(e) => e.webgpu_error_type(),
             RenderPassErrorInner::DestroyedResource(e) => e.webgpu_error_type(),
@@ -2332,6 +2344,7 @@ pub(super) fn encode_render_pass(
             blend_constant: OptionalState::Unused,
             stencil_reference: 0,
             pipeline: None,
+            work_graph: None,
             index: IndexState::default(),
             vertex: VertexState::default(),
 
@@ -2391,6 +2404,23 @@ pub(super) fn encode_render_pass(
                 ArcRenderCommand::SetPipeline(pipeline) => {
                     let scope = PassErrorScope::SetPipelineRender;
                     set_pipeline(&mut state, device, pipeline).map_pass_err(scope)?;
+                }
+                ArcRenderCommand::SetWorkGraphPipeline {
+                    pipeline,
+                    backing_memory,
+                    offset,
+                    size,
+                } => {
+                    let scope = PassErrorScope::SetPipelineWorkGraph;
+                    set_work_graph_pipeline(
+                        &mut state,
+                        device,
+                        pipeline,
+                        backing_memory,
+                        offset,
+                        size,
+                    )
+                    .map_pass_err(scope)?;
                 }
                 ArcRenderCommand::SetIndexBuffer {
                     buffer,
@@ -2493,6 +2523,10 @@ pub(super) fn encode_render_pass(
                     };
                     draw_mesh_tasks(&mut state, group_count_x, group_count_y, group_count_z)
                         .map_pass_err(scope)?;
+                }
+                ArcRenderCommand::DispatchGraph { inputs } => {
+                    let scope = PassErrorScope::DispatchGraph { indirect: false };
+                    dispatch_graph(&mut state, inputs).map_pass_err(scope)?;
                 }
                 ArcRenderCommand::DrawIndirect {
                     buffer,
@@ -2748,6 +2782,7 @@ fn set_pipeline(
     api_log!("RenderPass::set_pipeline {}", pipeline.error_ident());
 
     state.pipeline = Some(pipeline.clone());
+    state.work_graph = None;
 
     let pipeline = state
         .pass
@@ -2805,6 +2840,164 @@ fn set_pipeline(
 
     // Update vertex buffer limits.
     state.vertex.update_limits(&pipeline.vertex_steps);
+    Ok(())
+}
+
+fn set_work_graph_pipeline(
+    state: &mut State,
+    device: &Arc<Device>,
+    pipeline: Arc<WorkGraphPipeline>,
+    backing_memory: Arc<Buffer>,
+    offset: BufferAddress,
+    size: Option<BufferAddress>,
+) -> Result<(), RenderPassErrorInner> {
+    api_log!(
+        "RenderPass::set_work_graph_pipeline {}",
+        pipeline.error_ident()
+    );
+
+    device.require_features(wgt::Features::EXPERIMENTAL_WORK_GRAPHS_1_1)?;
+    pipeline.same_device(device)?;
+    backing_memory.same_device(device)?;
+    backing_memory.check_usage(BufferUsages::STORAGE)?;
+    backing_memory.check_destroyed(state.pass.base.snatch_guard)?;
+
+    let Some(pass_context) = pipeline.pass_context.as_ref() else {
+        return Err(WorkGraphError::NoMeshNodesInRenderPass.into());
+    };
+    state
+        .info
+        .context
+        .check_compatible(pass_context, pipeline.as_ref())
+        .map_err(RenderCommandError::IncompatiblePipelineTargets)?;
+    if pipeline.flags.contains(PipelineFlags::WRITES_DEPTH) && state.info.is_depth_read_only {
+        return Err(RenderCommandError::IncompatibleDepthAccess(pipeline.error_ident()).into());
+    }
+    if pipeline.flags.contains(PipelineFlags::WRITES_STENCIL) && state.info.is_stencil_read_only {
+        return Err(RenderCommandError::IncompatibleStencilAccess(pipeline.error_ident()).into());
+    }
+
+    let size = validate_backing_memory(&pipeline, &backing_memory, offset, size)?;
+    state
+        .pass
+        .scope
+        .buffers
+        .merge_single(&backing_memory, wgt::BufferUses::WORK_GRAPH_BACKING_MEMORY)?;
+
+    let pipeline = state
+        .pass
+        .base
+        .tracker
+        .work_graph_pipelines
+        .insert_single(pipeline)
+        .clone();
+
+    state.pipeline = None;
+    state.pipeline_flags = pipeline.flags;
+    state
+        .blend_constant
+        .require(pipeline.flags.contains(PipelineFlags::BLEND_CONSTANT));
+
+    unsafe {
+        state
+            .pass
+            .base
+            .raw_encoder
+            .set_work_graph_pipeline(pipeline.raw()?);
+    }
+
+    if pipeline.flags.contains(PipelineFlags::STENCIL_REFERENCE) {
+        unsafe {
+            state
+                .pass
+                .base
+                .raw_encoder
+                .set_stencil_reference(state.stencil_reference);
+        }
+    }
+
+    // Rebind resources
+    pass::change_pipeline_layout::<RenderPassErrorInner>(
+        &mut state.pass,
+        pipeline.layout()?,
+        &pipeline.late_sized_buffer_groups,
+    )?;
+
+    state.work_graph = Some(WorkGraphState {
+        pipeline,
+        backing_memory,
+        offset,
+        size,
+        initialize: true,
+    });
+    Ok(())
+}
+
+fn dispatch_graph(
+    state: &mut State,
+    inputs: Vec<wgt::WorkGraphNodeInput<Vec<u8>>>,
+) -> Result<(), RenderPassErrorInner> {
+    api_log!("RenderPass::dispatch_graph");
+
+    let Some(work_graph) = state.work_graph.as_ref() else {
+        return Err(WorkGraphError::MissingPipeline.into());
+    };
+    state
+        .pass
+        .binder
+        .check_compatibility(work_graph.pipeline.as_ref())
+        .map_err(DrawError::from)?;
+    state
+        .pass
+        .binder
+        .check_late_buffer_bindings()
+        .map_err(DrawError::from)?;
+    if state.blend_constant == OptionalState::Required {
+        return Err(DrawError::MissingBlendConstant.into());
+    }
+    validate_cpu_inputs(&work_graph.pipeline, &inputs)?;
+
+    if inputs.is_empty() {
+        return Ok(());
+    }
+
+    let backing_memory = work_graph.backing_memory.clone();
+    let offset = work_graph.offset;
+    let size = work_graph.size;
+    let initialize = work_graph.initialize;
+
+    state.flush_bindings()?;
+    state.flush_immediates();
+
+    let inputs = inputs
+        .iter()
+        .map(|input| wgt::WorkGraphNodeInput {
+            entrypoint_index: input.entrypoint_index,
+            num_records: input.num_records,
+            record_stride: input.record_stride,
+            records: input.records.as_slice(),
+        })
+        .collect::<Vec<_>>();
+    let raw_backing_memory = backing_memory.try_raw(state.pass.base.snatch_guard)?;
+    unsafe {
+        state
+            .pass
+            .base
+            .raw_encoder
+            .dispatch_graph(&hal::DispatchGraphDescriptor {
+                backing_memory: hal::WorkGraphBackingMemory {
+                    buffer: raw_backing_memory,
+                    offset,
+                    size,
+                },
+                initialize,
+                inputs: hal::DispatchGraphInputs::Cpu(&inputs),
+            });
+    }
+
+    if let Some(work_graph) = state.work_graph.as_mut() {
+        work_graph.initialize = false;
+    }
     Ok(())
 }
 
@@ -3683,6 +3876,84 @@ impl RenderPass {
         if let Err(err) = self.set_pipeline_inner(pipeline) {
             self.device
                 .handle_error(err, self.label(), "RenderPass::set_pipeline");
+        }
+    }
+
+    fn set_work_graph_pipeline_inner(
+        &mut self,
+        pipeline: Arc<WorkGraphPipeline>,
+        backing_memory: Arc<Buffer>,
+        offset: BufferAddress,
+        size: Option<BufferAddress>,
+    ) -> Result<(), PassStateError> {
+        let scope = PassErrorScope::SetPipelineWorkGraph;
+        let base = pass_base!(self, scope);
+
+        // A render pipeline must be set again after the work graph pipeline.
+        self.current_pipeline.reset();
+
+        pass_try!(base, scope, pipeline.check_valid());
+        pass_try!(base, scope, backing_memory.check_is_valid());
+
+        base.commands.push(ArcRenderCommand::SetWorkGraphPipeline {
+            pipeline,
+            backing_memory,
+            offset,
+            size,
+        });
+
+        Ok(())
+    }
+
+    /// Sets a work graph pipeline with mesh nodes, which is used by subsequent calls to
+    /// [`dispatch_graph`](Self::dispatch_graph), and the buffer region holding its backing memory.
+    pub fn set_work_graph_pipeline(
+        &mut self,
+        pipeline: Arc<WorkGraphPipeline>,
+        backing_memory: Arc<Buffer>,
+        offset: BufferAddress,
+        size: Option<BufferAddress>,
+    ) {
+        if let Err(error) =
+            self.set_work_graph_pipeline_inner(pipeline, backing_memory, offset, size)
+        {
+            self.device
+                .handle_error(error, self.label(), "RenderPass::set_work_graph_pipeline");
+        }
+    }
+
+    fn dispatch_graph_inner(
+        &mut self,
+        inputs: &[wgt::WorkGraphNodeInput<&[u8]>],
+    ) -> Result<(), PassStateError> {
+        let scope = PassErrorScope::DispatchGraph { indirect: false };
+        let base = pass_base!(self, scope);
+
+        base.commands.push(ArcRenderCommand::DispatchGraph {
+            inputs: inputs
+                .iter()
+                .map(|input| wgt::WorkGraphNodeInput {
+                    entrypoint_index: input.entrypoint_index,
+                    num_records: input.num_records,
+                    record_stride: input.record_stride,
+                    records: input.records.to_vec(),
+                })
+                .collect(),
+        });
+
+        Ok(())
+    }
+
+    /// Submits input records to the entrypoints of the current work graph pipeline.
+    ///
+    /// # Safety
+    ///
+    /// The input records must not violate any limits declared by the nodes receiving them,
+    /// such as `SV_DispatchGrid` exceeding `NodeMaxDispatchGrid`.
+    pub unsafe fn dispatch_graph(&mut self, inputs: &[wgt::WorkGraphNodeInput<&[u8]>]) {
+        if let Err(error) = self.dispatch_graph_inner(inputs) {
+            self.device
+                .handle_error(error, self.label(), "RenderPass::dispatch_graph");
         }
     }
 

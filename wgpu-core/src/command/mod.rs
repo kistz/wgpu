@@ -26,6 +26,7 @@ mod render_command;
 mod timestamp_writes;
 mod transfer;
 mod transition_resources;
+mod work_graph;
 
 use alloc::{borrow::ToOwned as _, boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::convert::Infallible;
@@ -65,6 +66,7 @@ pub use self::{
     render_command::ArcRenderCommand,
     transfer::{CopySide, TransferError},
     transition_resources::TransitionResourcesError,
+    work_graph::WorkGraphError,
 };
 pub(crate) use self::{
     clear::clear_texture,

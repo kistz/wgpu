@@ -91,6 +91,7 @@ mod shader_compilation;
 mod suballocation;
 mod types;
 mod view;
+mod work_graph_preview;
 
 use alloc::{borrow::ToOwned as _, string::String, sync::Arc, vec::Vec};
 use core::{ffi, fmt, mem, ops::Deref};

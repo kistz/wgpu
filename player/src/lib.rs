@@ -341,6 +341,8 @@ impl Player {
                     program_name: desc.program_name,
                     entrypoints: desc.entrypoints,
                     include_all_available_nodes: desc.include_all_available_nodes,
+                    mesh_nodes: desc.mesh_nodes,
+                    max_input_records: desc.max_input_records,
                 };
                 let pipeline = device.create_work_graph_pipeline(resolved_desc);
                 self.work_graph_pipelines.insert(id, pipeline);
@@ -1127,6 +1129,21 @@ impl Player {
                 bind_group: bind_group.map(|bg| self.resolve_bind_group_id(bg)),
             },
             C::SetPipeline(id) => C::SetPipeline(self.resolve_render_pipeline_id(id)),
+            C::SetWorkGraphPipeline {
+                pipeline,
+                backing_memory,
+                offset,
+                size,
+            } => C::SetWorkGraphPipeline {
+                pipeline: self
+                    .work_graph_pipelines
+                    .get(&pipeline)
+                    .expect("invalid work graph pipeline")
+                    .clone(),
+                backing_memory: self.resolve_buffer_id(backing_memory),
+                offset,
+                size,
+            },
             C::SetIndexBuffer {
                 buffer,
                 index_format,
@@ -1195,6 +1212,7 @@ impl Player {
                 group_count_y,
                 group_count_z,
             },
+            C::DispatchGraph { inputs } => C::DispatchGraph { inputs },
             C::DrawIndirect {
                 buffer,
                 offset,

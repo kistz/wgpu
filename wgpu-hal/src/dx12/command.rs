@@ -1416,6 +1416,8 @@ impl crate::CommandEncoder for super::CommandEncoder {
             self.reset_signature(&pipeline.layout);
         };
 
+        self.pass.work_graph = None;
+        self.pass.bound_work_graph = None;
         unsafe { list.SetPipelineState(&pipeline.raw) };
         unsafe { list.IASetPrimitiveTopology(pipeline.topology) };
 
@@ -1791,7 +1793,12 @@ impl crate::CommandEncoder for super::CommandEncoder {
 
         if self.pass.layout.signature != pipeline.layout.signature {
             // D3D12 requires full reset on signature change
-            unsafe { list.SetComputeRootSignature(pipeline.layout.signature.as_ref()) };
+            match self.pass.kind {
+                super::PassKind::Render => unsafe {
+                    list.SetGraphicsRootSignature(pipeline.layout.signature.as_ref())
+                },
+                _ => unsafe { list.SetComputeRootSignature(pipeline.layout.signature.as_ref()) },
+            }
             self.reset_signature(&pipeline.layout);
         };
 

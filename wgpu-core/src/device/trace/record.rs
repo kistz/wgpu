@@ -557,6 +557,17 @@ impl IntoTrace for ArcRenderCommand {
                 bind_group: bind_group.map(|bg| bg.into_trace()),
             },
             C::SetPipeline(id) => C::SetPipeline(id.into_trace()),
+            C::SetWorkGraphPipeline {
+                pipeline,
+                backing_memory,
+                offset,
+                size,
+            } => C::SetWorkGraphPipeline {
+                pipeline: pipeline.into_trace(),
+                backing_memory: backing_memory.into_trace(),
+                offset,
+                size,
+            },
             C::SetIndexBuffer {
                 buffer,
                 index_format,
@@ -625,6 +636,7 @@ impl IntoTrace for ArcRenderCommand {
                 group_count_y,
                 group_count_z,
             },
+            C::DispatchGraph { inputs } => C::DispatchGraph { inputs },
             C::DrawIndirect {
                 buffer,
                 offset,
@@ -810,6 +822,8 @@ impl<'a> IntoTrace for crate::pipeline::WorkGraphPipelineDescriptor<'a> {
             program_name: self.program_name,
             entrypoints: self.entrypoints,
             include_all_available_nodes: self.include_all_available_nodes,
+            mesh_nodes: self.mesh_nodes,
+            max_input_records: self.max_input_records,
         }
     }
 }
@@ -1153,6 +1167,12 @@ fn action_to_owned(action: Action<'_, PointerReferences>) -> Action<'static, Poi
                     .map(|node| node.clone().into_owned())
                     .collect(),
                 include_all_available_nodes: desc.include_all_available_nodes,
+                mesh_nodes: desc
+                    .mesh_nodes
+                    .iter()
+                    .map(|node| node.clone().into_owned())
+                    .collect(),
+                max_input_records: desc.max_input_records,
             },
         },
         A::CreateGeneralRenderPipeline { id, desc } => A::CreateGeneralRenderPipeline {

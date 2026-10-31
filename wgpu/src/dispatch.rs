@@ -484,6 +484,14 @@ pub trait ComputePassInterface: CommonTraits + Drop {
 }
 pub trait RenderPassInterface: CommonTraits + Drop {
     fn set_pipeline(&mut self, pipeline: &DispatchRenderPipeline);
+    fn set_work_graph_pipeline(
+        &mut self,
+        pipeline: &DispatchWorkGraphPipeline,
+        backing_memory: &DispatchBuffer,
+        offset: crate::BufferAddress,
+        size: crate::BufferAddress,
+    );
+    unsafe fn dispatch_graph(&mut self, inputs: &[wgt::WorkGraphNodeInput<&[u8]>]);
     fn set_bind_group(
         &mut self,
         index: u32,

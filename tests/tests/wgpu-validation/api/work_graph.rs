@@ -3,6 +3,7 @@
 //! The noop backend reports a minimum backing memory size of 256 bytes, and one
 //! entrypoint for each node listed in [`WorkGraphPipelineDescriptor::entrypoints`],
 //! each with a record size of 16 bytes and a record alignment of 4 bytes.
+//! Mesh node tests use the same pipelines with an `Rgba8Unorm` mesh node.
 
 use std::borrow::Cow;
 
@@ -53,6 +54,8 @@ fn pipeline_with_layout(device: &Device, layout: &PipelineLayout) -> WorkGraphPi
             array_index: 0,
         }],
         include_all_available_nodes: true,
+        mesh_nodes: &[],
+        max_input_records: None,
     })
 }
 
@@ -143,6 +146,8 @@ fn create_requires_passthrough_module() {
                 program_name: "graph",
                 entrypoints: &[],
                 include_all_available_nodes: true,
+                mesh_nodes: &[],
+                max_input_records: None,
             })
         },
         Some("passthrough shader module"),
@@ -726,4 +731,444 @@ fn work_graph_input_address_requires_storage_usage() {
     let (device, _queue) = work_graph_device();
     let buffer = gpu_input_buffer(&device, 24, BufferUsages::INDIRECT);
     buffer.work_graph_input_address();
+}
+
+fn mesh_node_device() -> (Device, Queue) {
+    device(
+        Features::EXPERIMENTAL_WORK_GRAPHS
+            | Features::EXPERIMENTAL_WORK_GRAPHS_1_1
+            | Features::PASSTHROUGH_SHADERS,
+    )
+}
+
+const MAX_INPUT_RECORDS: WorkGraphMaxInputRecords = WorkGraphMaxInputRecords {
+    records: 4,
+    node_inputs: 1,
+};
+
+const RGBA8_TARGETS: &[Option<ColorTargetState>] = &[Some(ColorTargetState {
+    format: TextureFormat::Rgba8Unorm,
+    blend: None,
+    write_mask: ColorWrites::ALL,
+})];
+
+fn mesh_node(targets: &[Option<ColorTargetState>]) -> WorkGraphMeshNode<'_> {
+    WorkGraphMeshNode {
+        node: WorkGraphNodeId {
+            name: Cow::Borrowed("mesh"),
+            array_index: 0,
+        },
+        mesh_entry_point: "mesh_main",
+        fragment: Some(WorkGraphFragmentState {
+            entry_point: "fragment_main",
+            targets,
+        }),
+        primitive: PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: MultisampleState::default(),
+    }
+}
+
+fn mesh_pipeline_with(
+    device: &Device,
+    layout: &PipelineLayout,
+    mesh_nodes: &[WorkGraphMeshNode<'_>],
+    max_input_records: Option<WorkGraphMaxInputRecords>,
+) -> WorkGraphPipeline {
+    let module = library(device);
+    device.create_work_graph_pipeline(&WorkGraphPipelineDescriptor {
+        label: Some("mesh work graph"),
+        layout,
+        module: &module,
+        program_name: "graph",
+        entrypoints: &[WorkGraphNodeId {
+            name: Cow::Borrowed("entry"),
+            array_index: 0,
+        }],
+        include_all_available_nodes: true,
+        mesh_nodes,
+        max_input_records,
+    })
+}
+
+fn mesh_pipeline(device: &Device) -> WorkGraphPipeline {
+    mesh_pipeline_with(
+        device,
+        &layout(device, None),
+        &[mesh_node(RGBA8_TARGETS)],
+        Some(MAX_INPUT_RECORDS),
+    )
+}
+
+fn render_target(device: &Device, format: TextureFormat) -> TextureView {
+    device
+        .create_texture(&TextureDescriptor {
+            label: Some("render target"),
+            size: Extent3d {
+                width: 4,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format,
+            usage: TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&TextureViewDescriptor::default())
+}
+
+fn begin_render_pass<'a>(encoder: &'a mut CommandEncoder, target: &TextureView) -> RenderPass<'a> {
+    encoder.begin_render_pass(&RenderPassDescriptor {
+        label: None,
+        color_attachments: &[Some(RenderPassColorAttachment {
+            view: target,
+            depth_slice: None,
+            resolve_target: None,
+            ops: Operations::default(),
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    })
+}
+
+/// Encodes a render pass that draws to `target`, sets `pipeline` with `backing_memory` and
+/// dispatches `inputs`.
+fn encode_render_dispatch(
+    device: &Device,
+    target: &TextureView,
+    pipeline: &WorkGraphPipeline,
+    backing_memory: BufferSlice<'_>,
+    inputs: &[WorkGraphNodeInput<&[u8]>],
+) -> CommandBuffer {
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+    {
+        let mut pass = begin_render_pass(&mut encoder, target);
+        pass.set_work_graph_pipeline(pipeline, backing_memory);
+        unsafe { pass.dispatch_graph(inputs) };
+    }
+    encoder.finish()
+}
+
+#[test]
+fn mesh_nodes_require_feature() {
+    let (device, _queue) = work_graph_device();
+    fail(
+        &device,
+        || {
+            mesh_pipeline_with(
+                &device,
+                &layout(&device, None),
+                &[mesh_node(RGBA8_TARGETS)],
+                Some(MAX_INPUT_RECORDS),
+            )
+        },
+        Some("EXPERIMENTAL_WORK_GRAPHS_1_1"),
+    );
+}
+
+#[test]
+fn mesh_nodes_require_max_input_records() {
+    let (device, _queue) = mesh_node_device();
+    fail(
+        &device,
+        || {
+            mesh_pipeline_with(
+                &device,
+                &layout(&device, None),
+                &[mesh_node(RGBA8_TARGETS)],
+                None,
+            )
+        },
+        Some("max_input_records"),
+    );
+}
+
+#[test]
+fn mesh_node_requires_list_topology() {
+    let (device, _queue) = mesh_node_device();
+    let mut node = mesh_node(RGBA8_TARGETS);
+    node.primitive.topology = PrimitiveTopology::TriangleStrip;
+    fail(
+        &device,
+        || {
+            mesh_pipeline_with(
+                &device,
+                &layout(&device, None),
+                &[node],
+                Some(MAX_INPUT_RECORDS),
+            )
+        },
+        Some("list topology"),
+    );
+}
+
+#[test]
+fn mesh_node_validates_color_targets() {
+    let (device, _queue) = mesh_node_device();
+    let targets = [Some(ColorTargetState {
+        format: TextureFormat::Depth32Float,
+        blend: None,
+        write_mask: ColorWrites::ALL,
+    })];
+    fail(
+        &device,
+        || {
+            mesh_pipeline_with(
+                &device,
+                &layout(&device, None),
+                &[mesh_node(&targets)],
+                Some(MAX_INPUT_RECORDS),
+            )
+        },
+        Some("Mesh node 0 is invalid"),
+    );
+}
+
+#[test]
+fn mesh_nodes_share_targets() {
+    let (device, _queue) = mesh_node_device();
+    let bgra8_targets = [Some(ColorTargetState::from(TextureFormat::Bgra8Unorm))];
+    let mut second = mesh_node(&bgra8_targets);
+    second.node.name = Cow::Borrowed("second");
+    fail(
+        &device,
+        || {
+            mesh_pipeline_with(
+                &device,
+                &layout(&device, None),
+                &[mesh_node(RGBA8_TARGETS), second],
+                Some(MAX_INPUT_RECORDS),
+            )
+        },
+        Some("Mesh node 1 renders to different attachment formats"),
+    );
+}
+
+#[test]
+fn mesh_dispatch_valid() {
+    let (device, _queue) = mesh_node_device();
+    let pipeline = mesh_pipeline(&device);
+    let memory = backing_memory(&device, MIN_BACKING_MEMORY_SIZE, BufferUsages::STORAGE);
+    let target = render_target(&device, TextureFormat::Rgba8Unorm);
+    let records = [0; 64];
+    valid(&device, || {
+        encode_render_dispatch(
+            &device,
+            &target,
+            &pipeline,
+            memory.slice(..),
+            &[input(0, 4, 16, &records)],
+        )
+    });
+}
+
+#[test]
+fn mesh_pipeline_in_compute_pass() {
+    let (device, _queue) = mesh_node_device();
+    let pipeline = mesh_pipeline(&device);
+    let memory = backing_memory(&device, MIN_BACKING_MEMORY_SIZE, BufferUsages::STORAGE);
+    let records = [0; 16];
+    fail(
+        &device,
+        || {
+            encode_dispatch(
+                &device,
+                &pipeline,
+                memory.slice(..),
+                &[input(0, 1, 16, &records)],
+            )
+        },
+        Some("can only be used in a render pass"),
+    );
+}
+
+#[test]
+fn render_pass_requires_mesh_nodes() {
+    let (device, _queue) = mesh_node_device();
+    let pipeline = pipeline(&device);
+    let memory = backing_memory(&device, MIN_BACKING_MEMORY_SIZE, BufferUsages::STORAGE);
+    let target = render_target(&device, TextureFormat::Rgba8Unorm);
+    let records = [0; 16];
+    fail(
+        &device,
+        || {
+            encode_render_dispatch(
+                &device,
+                &target,
+                &pipeline,
+                memory.slice(..),
+                &[input(0, 1, 16, &records)],
+            )
+        },
+        Some("without mesh nodes"),
+    );
+}
+
+#[test]
+fn mesh_dispatch_incompatible_targets() {
+    let (device, _queue) = mesh_node_device();
+    let pipeline = mesh_pipeline(&device);
+    let memory = backing_memory(&device, MIN_BACKING_MEMORY_SIZE, BufferUsages::STORAGE);
+    let target = render_target(&device, TextureFormat::Bgra8Unorm);
+    let records = [0; 16];
+    fail(
+        &device,
+        || {
+            encode_render_dispatch(
+                &device,
+                &target,
+                &pipeline,
+                memory.slice(..),
+                &[input(0, 1, 16, &records)],
+            )
+        },
+        Some("Incompatible color attachments"),
+    );
+}
+
+#[test]
+fn mesh_dispatch_depth_write_with_read_only_depth() {
+    let (device, _queue) = mesh_node_device();
+    let mut node = mesh_node(RGBA8_TARGETS);
+    node.depth_stencil = Some(DepthStencilState {
+        format: TextureFormat::Depth32Float,
+        depth_write_enabled: Some(true),
+        depth_compare: Some(CompareFunction::Less),
+        stencil: StencilState::default(),
+        bias: DepthBiasState::default(),
+    });
+    let pipeline = mesh_pipeline_with(
+        &device,
+        &layout(&device, None),
+        &[node],
+        Some(MAX_INPUT_RECORDS),
+    );
+    let memory = backing_memory(&device, MIN_BACKING_MEMORY_SIZE, BufferUsages::STORAGE);
+    let target = render_target(&device, TextureFormat::Rgba8Unorm);
+    let depth = render_target(&device, TextureFormat::Depth32Float);
+    fail(
+        &device,
+        || {
+            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+            {
+                let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &target,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: Operations::default(),
+                    })],
+                    depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                        view: &depth,
+                        depth_ops: None,
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_work_graph_pipeline(&pipeline, memory.slice(..));
+            }
+            encoder.finish()
+        },
+        Some("read-only depth access"),
+    );
+}
+
+#[test]
+fn mesh_dispatch_too_many_records() {
+    let (device, _queue) = mesh_node_device();
+    let pipeline = mesh_pipeline(&device);
+    let memory = backing_memory(&device, MIN_BACKING_MEMORY_SIZE, BufferUsages::STORAGE);
+    let target = render_target(&device, TextureFormat::Rgba8Unorm);
+    let records = [0; 16];
+    fail(
+        &device,
+        || {
+            encode_render_dispatch(
+                &device,
+                &target,
+                &pipeline,
+                memory.slice(..),
+                &[input(0, 5, 0, &records)],
+            )
+        },
+        Some("allows at most 4 records in 1 inputs"),
+    );
+    fail(
+        &device,
+        || {
+            encode_render_dispatch(
+                &device,
+                &target,
+                &pipeline,
+                memory.slice(..),
+                &[input(0, 1, 16, &records), input(0, 1, 16, &records)],
+            )
+        },
+        Some("2 records in 2 inputs"),
+    );
+}
+
+#[test]
+fn draw_after_work_graph_requires_render_pipeline() {
+    let (device, _queue) = mesh_node_device();
+    let pipeline = mesh_pipeline(&device);
+    let memory = backing_memory(&device, MIN_BACKING_MEMORY_SIZE, BufferUsages::STORAGE);
+    let target = render_target(&device, TextureFormat::Rgba8Unorm);
+    fail(
+        &device,
+        || {
+            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+            {
+                let mut pass = begin_render_pass(&mut encoder, &target);
+                pass.set_work_graph_pipeline(&pipeline, memory.slice(..));
+                pass.draw(0..3, 0..1);
+            }
+            encoder.finish()
+        },
+        Some("Render pipeline must be set"),
+    );
+}
+
+#[test]
+fn mesh_backing_memory_bound_as_storage() {
+    let (device, _queue) = mesh_node_device();
+    let bind_group_layout = storage_bind_group_layout(&device);
+    let pipeline = mesh_pipeline_with(
+        &device,
+        &layout(&device, Some(&bind_group_layout)),
+        &[mesh_node(RGBA8_TARGETS)],
+        Some(MAX_INPUT_RECORDS),
+    );
+    let memory = backing_memory(&device, MIN_BACKING_MEMORY_SIZE, BufferUsages::STORAGE);
+    let bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: None,
+        layout: &bind_group_layout,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: memory.as_entire_binding(),
+        }],
+    });
+    let target = render_target(&device, TextureFormat::Rgba8Unorm);
+    let records = [0; 16];
+    fail(
+        &device,
+        || {
+            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+            {
+                let mut pass = begin_render_pass(&mut encoder, &target);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.set_work_graph_pipeline(&pipeline, memory.slice(..));
+                unsafe { pass.dispatch_graph(&[input(0, 1, 16, &records)]) };
+            }
+            encoder.finish()
+        },
+        Some("WORK_GRAPH_BACKING_MEMORY"),
+    );
 }

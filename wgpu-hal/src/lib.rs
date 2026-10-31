@@ -1911,15 +1911,18 @@ pub trait CommandEncoder: WasmNotSendSync + fmt::Debug {
 
     /// Set the work graph pipeline used by subsequent calls to [`dispatch_graph`].
     ///
-    /// This replaces any compute pipeline set by [`set_compute_pipeline`].
+    /// This replaces any compute pipeline set by [`set_compute_pipeline`] or render pipeline set
+    /// by [`set_render_pipeline`].
     ///
     /// # Safety
     ///
-    /// - There must be an active compute pass.
+    /// - If the pipeline has mesh nodes, there must be an active render pass with attachments
+    ///   that match the mesh nodes. Otherwise, there must be an active compute pass.
     /// - Pipeline must not be destroyed.
     ///
     /// [`dispatch_graph`]: CommandEncoder::dispatch_graph
     /// [`set_compute_pipeline`]: CommandEncoder::set_compute_pipeline
+    /// [`set_render_pipeline`]: CommandEncoder::set_render_pipeline
     unsafe fn set_work_graph_pipeline(&mut self, pipeline: &<Self::A as Api>::WorkGraphPipeline);
 
     /// Submit input records to the current work graph pipeline.
@@ -1927,7 +1930,9 @@ pub trait CommandEncoder: WasmNotSendSync + fmt::Debug {
     /// # Safety
     ///
     /// - A work graph pipeline must have been set with [`set_work_graph_pipeline`]
-    ///   since the last call to [`set_compute_pipeline`] in this pass.
+    ///   since the last call to [`set_compute_pipeline`] or [`set_render_pipeline`] in this pass.
+    /// - If the pipeline has mesh nodes, the input must not exceed its `max_input_records`, and
+    ///   the input must be in CPU memory.
     /// - The backing memory must be in the [`wgt::BufferUses::WORK_GRAPH_BACKING_MEMORY`] state,
     ///   its offset must be a multiple of [`wgt::WORK_GRAPH_BACKING_MEMORY_ALIGNMENT`],
     ///   and its size must be at least the pipeline's minimum backing memory size.
@@ -1944,6 +1949,7 @@ pub trait CommandEncoder: WasmNotSendSync + fmt::Debug {
     ///
     /// [`set_work_graph_pipeline`]: CommandEncoder::set_work_graph_pipeline
     /// [`set_compute_pipeline`]: CommandEncoder::set_compute_pipeline
+    /// [`set_render_pipeline`]: CommandEncoder::set_render_pipeline
     unsafe fn dispatch_graph(&mut self, desc: &DispatchGraphDescriptor<<Self::A as Api>::Buffer>);
 
     /// Begin a new ray tracing pass, clearing all active bindings.
@@ -2782,6 +2788,25 @@ pub struct WorkGraphPipelineDescriptor<
     pub entrypoints: &'a [wgt::WorkGraphNodeId<'a>],
     /// Add all nodes in the library to the work graph.
     pub include_all_available_nodes: bool,
+    /// Mesh nodes of the work graph. A work graph with mesh nodes runs in a render pass.
+    pub mesh_nodes: &'a [WorkGraphMeshNode<'a>],
+    /// Upper bounds on the input of each dispatch. Must be `Some` if there are mesh nodes.
+    pub max_input_records: Option<wgt::WorkGraphMaxInputRecords>,
+}
+
+/// A mesh node of a work graph, and the graphics state that it draws with.
+#[derive(Clone, Debug)]
+pub struct WorkGraphMeshNode<'a> {
+    pub node: wgt::WorkGraphNodeId<'a>,
+    /// Name of the mesh node shader in the shader library.
+    pub mesh_entry_point: &'a str,
+    /// Name of the fragment shader in the shader library.
+    pub fragment_entry_point: Option<&'a str>,
+    pub color_targets: &'a [Option<wgt::ColorTargetState>],
+    /// The topology matches the output topology of the mesh node shader.
+    pub primitive: wgt::PrimitiveState,
+    pub depth_stencil: Option<wgt::DepthStencilState>,
+    pub multisample: wgt::MultisampleState,
 }
 
 /// Properties of a work graph pipeline that are known after its creation.

@@ -21,6 +21,9 @@ use crate::{
             end_pipeline_statistics_query, record_pass_timestamp_writes,
             validate_and_begin_pipeline_statistics_query,
         },
+        work_graph::{
+            validate_backing_memory, validate_cpu_inputs, WorkGraphError, WorkGraphState,
+        },
         ArcCommand, BasePass, BindGroupStateChange, CommandEncoder, CommandEncoderError,
         DebugGroupError, EncoderStateError, InnerCommandEncoder, MapPassErr, PassErrorScope,
         PassStateError, PassTimestampWrites, QueryUseError, StateChange, TimestampWritesError,
@@ -157,72 +160,6 @@ impl WebGpuError for DispatchError {
     }
 }
 
-#[derive(Clone, Debug, Error)]
-#[non_exhaustive]
-pub enum WorkGraphError {
-    #[error("Work graph pipeline must be set")]
-    MissingPipeline,
-    #[error(
-        "Backing memory offset {0} is not a multiple of {alignment}",
-        alignment = wgt::WORK_GRAPH_BACKING_MEMORY_ALIGNMENT
-    )]
-    UnalignedBackingMemoryOffset(BufferAddress),
-    #[error("Backing memory of {size} bytes starting at offset {offset} would overrun buffer of size {buffer_size}")]
-    BackingMemoryOverrun {
-        offset: BufferAddress,
-        size: BufferAddress,
-        buffer_size: BufferAddress,
-    },
-    #[error("Backing memory of {size} bytes is smaller than the minimum size {min_size} required by the work graph")]
-    BackingMemoryTooSmall {
-        size: BufferAddress,
-        min_size: BufferAddress,
-    },
-    #[error("Entrypoint index {index} of input {input} is out of range for a work graph with {count} entrypoints")]
-    InvalidEntrypoint {
-        input: usize,
-        index: u32,
-        count: usize,
-    },
-    #[error(
-        "Record stride {stride} of input {input} is smaller than the record size {record_size}"
-    )]
-    RecordStrideTooSmall {
-        input: usize,
-        stride: u64,
-        record_size: u32,
-    },
-    #[error("Record stride {stride} of input {input} is not a multiple of {alignment}")]
-    UnalignedRecordStride {
-        input: usize,
-        stride: u64,
-        alignment: u64,
-    },
-    #[error("Input {input} provides {size} bytes of records, but {required} bytes are required")]
-    RecordsTooSmall {
-        input: usize,
-        size: u64,
-        required: u64,
-    },
-    #[error(
-        "GPU input offset {0} is not a multiple of {alignment}",
-        alignment = wgt::WORK_GRAPH_GPU_INPUT_ALIGNMENT
-    )]
-    UnalignedGpuInputOffset(BufferAddress),
-    #[error("GPU input of {input_size} bytes starting at offset {offset} would overrun buffer of size {buffer_size}")]
-    GpuInputOverrun {
-        input_size: BufferAddress,
-        offset: BufferAddress,
-        buffer_size: BufferAddress,
-    },
-}
-
-impl WebGpuError for WorkGraphError {
-    fn webgpu_error_type(&self) -> ErrorType {
-        ErrorType::Validation
-    }
-}
-
 /// Error encountered when performing a compute pass.
 #[derive(Clone, Debug, Error)]
 pub enum ComputePassErrorInner {
@@ -339,15 +276,6 @@ impl WebGpuError for ComputePassError {
             | ComputePassErrorInner::PassEnded => ErrorType::Validation,
         }
     }
-}
-
-struct WorkGraphState {
-    pipeline: Arc<WorkGraphPipeline>,
-    backing_memory: Arc<Buffer>,
-    offset: BufferAddress,
-    size: BufferAddress,
-    /// The backing memory must be initialized by the next dispatch.
-    initialize: bool,
 }
 
 struct State<'scope, 'snatch_guard, 'cmd_enc> {
@@ -1321,23 +1249,10 @@ fn set_work_graph_pipeline(
     backing_memory.check_usage(wgt::BufferUsages::STORAGE)?;
     backing_memory.check_destroyed(state.pass.base.snatch_guard)?;
 
-    if !offset.is_multiple_of(wgt::WORK_GRAPH_BACKING_MEMORY_ALIGNMENT) {
-        return Err(WorkGraphError::UnalignedBackingMemoryOffset(offset).into());
+    if pipeline.has_mesh_nodes() {
+        return Err(WorkGraphError::MeshNodesOutsideRenderPass.into());
     }
-    let buffer_size = backing_memory.size;
-    let size = size.unwrap_or(buffer_size.saturating_sub(offset));
-    if offset > buffer_size || buffer_size - offset < size {
-        return Err(WorkGraphError::BackingMemoryOverrun {
-            offset,
-            size,
-            buffer_size,
-        }
-        .into());
-    }
-    let min_size = pipeline.memory_requirements.min_size;
-    if size < min_size {
-        return Err(WorkGraphError::BackingMemoryTooSmall { size, min_size }.into());
-    }
+    let size = validate_backing_memory(&pipeline, &backing_memory, offset, size)?;
 
     let pipeline = state
         .pass
@@ -1401,47 +1316,7 @@ fn dispatch_graph(
     api_log!("ComputePass::dispatch_graph");
 
     let work_graph = check_work_graph_ready(state)?;
-
-    let entrypoints = &work_graph.pipeline.entrypoints;
-    for (input_index, input) in inputs.iter().enumerate() {
-        let Some(entrypoint) = entrypoints.get(input.entrypoint_index as usize) else {
-            return Err(WorkGraphError::InvalidEntrypoint {
-                input: input_index,
-                index: input.entrypoint_index,
-                count: entrypoints.len(),
-            }
-            .into());
-        };
-        if entrypoint.record_size != 0 && input.record_stride != 0 {
-            if input.record_stride < u64::from(entrypoint.record_size) {
-                return Err(WorkGraphError::RecordStrideTooSmall {
-                    input: input_index,
-                    stride: input.record_stride,
-                    record_size: entrypoint.record_size,
-                }
-                .into());
-            }
-            let alignment = entrypoint.record_stride_alignment();
-            if !input.record_stride.is_multiple_of(alignment) {
-                return Err(WorkGraphError::UnalignedRecordStride {
-                    input: input_index,
-                    stride: input.record_stride,
-                    alignment,
-                }
-                .into());
-            }
-        }
-        let required = entrypoint.required_records_size(input.num_records, input.record_stride);
-        let size = input.records.len() as u64;
-        if size < required {
-            return Err(WorkGraphError::RecordsTooSmall {
-                input: input_index,
-                size,
-                required,
-            }
-            .into());
-        }
-    }
+    validate_cpu_inputs(&work_graph.pipeline, &inputs)?;
 
     if inputs.is_empty() {
         return Ok(());

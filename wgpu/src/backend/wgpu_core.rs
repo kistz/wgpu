@@ -1437,6 +1437,24 @@ impl dispatch::DeviceInterface for CoreDevice {
             program_name: Borrowed(desc.program_name),
             entrypoints: Borrowed(desc.entrypoints),
             include_all_available_nodes: desc.include_all_available_nodes,
+            mesh_nodes: desc
+                .mesh_nodes
+                .iter()
+                .map(|node| wgc::pipeline::WorkGraphMeshNodeDescriptor {
+                    node: node.node.clone(),
+                    mesh_entry_point: Borrowed(node.mesh_entry_point),
+                    fragment: node.fragment.as_ref().map(|fragment| {
+                        wgc::pipeline::WorkGraphFragmentState {
+                            entry_point: Borrowed(fragment.entry_point),
+                            targets: Borrowed(fragment.targets),
+                        }
+                    }),
+                    primitive: node.primitive,
+                    depth_stencil: node.depth_stencil.clone(),
+                    multisample: node.multisample,
+                })
+                .collect(),
+            max_input_records: desc.max_input_records,
         };
 
         let wgpu_work_graph_pipeline = self.wgpu_device.create_work_graph_pipeline(descriptor);
@@ -2510,6 +2528,28 @@ impl dispatch::RenderPassInterface for CoreRenderPass {
 
         self.pass
             .set_pipeline(pipeline.wgpu_render_pipeline.clone());
+    }
+
+    fn set_work_graph_pipeline(
+        &mut self,
+        pipeline: &dispatch::DispatchWorkGraphPipeline,
+        backing_memory: &dispatch::DispatchBuffer,
+        offset: crate::BufferAddress,
+        size: crate::BufferAddress,
+    ) {
+        let pipeline = pipeline.as_core();
+        let backing_memory = backing_memory.as_core();
+
+        self.pass.set_work_graph_pipeline(
+            pipeline.wgpu_work_graph_pipeline.clone(),
+            backing_memory.wgpu_buffer.clone(),
+            offset,
+            Some(size),
+        );
+    }
+
+    unsafe fn dispatch_graph(&mut self, inputs: &[wgt::WorkGraphNodeInput<&[u8]>]) {
+        unsafe { self.pass.dispatch_graph(inputs) };
     }
 
     fn set_bind_group(

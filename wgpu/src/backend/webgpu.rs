@@ -3857,6 +3857,20 @@ impl dispatch::RenderPassInterface for WebRenderPassEncoder {
         self.inner.set_pipeline(pipeline);
     }
 
+    fn set_work_graph_pipeline(
+        &mut self,
+        _pipeline: &dispatch::DispatchWorkGraphPipeline,
+        _backing_memory: &dispatch::DispatchBuffer,
+        _offset: crate::BufferAddress,
+        _size: crate::BufferAddress,
+    ) {
+        unimplemented!("Work graphs are not implemented for web")
+    }
+
+    unsafe fn dispatch_graph(&mut self, _inputs: &[wgt::WorkGraphNodeInput<&[u8]>]) {
+        unimplemented!("Work graphs are not implemented for web")
+    }
+
     fn set_bind_group(
         &mut self,
         index: u32,

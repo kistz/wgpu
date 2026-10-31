@@ -4674,6 +4674,34 @@ impl Device {
         let late_sized_buffer_groups =
             Device::make_late_sized_buffer_groups(&FastHashMap::default(), &pipeline_layout);
 
+        let (pass_context, flags) = self.validate_work_graph_mesh_nodes(&desc.mesh_nodes)?;
+        if pass_context.is_some() && desc.max_input_records.is_none() {
+            return Err(pipeline::CreatePipelineError::WorkGraphMissingMaxInputRecords);
+        }
+
+        let mesh_nodes = desc
+            .mesh_nodes
+            .iter()
+            .map(|node| hal::WorkGraphMeshNode {
+                node: wgt::WorkGraphNodeId {
+                    name: Cow::Borrowed(&node.node.name),
+                    array_index: node.node.array_index,
+                },
+                mesh_entry_point: &node.mesh_entry_point,
+                fragment_entry_point: node
+                    .fragment
+                    .as_ref()
+                    .map(|fragment| fragment.entry_point.as_ref()),
+                color_targets: node
+                    .fragment
+                    .as_ref()
+                    .map_or(&[][..], |fragment| &fragment.targets),
+                primitive: node.primitive,
+                depth_stencil: node.depth_stencil.clone(),
+                multisample: node.multisample,
+            })
+            .collect::<Vec<_>>();
+
         let pipeline_desc = hal::WorkGraphPipelineDescriptor {
             label: desc.label.to_hal(self.instance_flags),
             layout: pipeline_layout.raw()?,
@@ -4681,6 +4709,8 @@ impl Device {
             program_name: &desc.program_name,
             entrypoints: &desc.entrypoints,
             include_all_available_nodes: desc.include_all_available_nodes,
+            mesh_nodes: &mesh_nodes,
+            max_input_records: desc.max_input_records,
         };
 
         let (raw, info) = unsafe { self.raw().create_work_graph_pipeline(&pipeline_desc) }
@@ -4696,11 +4726,99 @@ impl Device {
             late_sized_buffer_groups,
             memory_requirements: info.memory_requirements,
             entrypoints: info.entrypoints,
+            max_input_records: desc.max_input_records,
+            pass_context,
+            flags,
             label: desc.label.to_string(),
             tracking_data: TrackingData::new(self.tracker_indices.work_graph_pipelines.clone()),
         };
 
         Ok(Arc::new(pipeline))
+    }
+
+    /// Validates the graphics state of the mesh nodes of a work graph.
+    ///
+    /// Returns the attachments that the mesh nodes render to, which all mesh nodes must share,
+    /// and the combined render pipeline flags of the mesh nodes.
+    fn validate_work_graph_mesh_nodes(
+        &self,
+        mesh_nodes: &[pipeline::WorkGraphMeshNodeDescriptor],
+    ) -> Result<(Option<RenderPassContext>, pipeline::PipelineFlags), pipeline::CreatePipelineError>
+    {
+        if mesh_nodes.is_empty() {
+            return Ok((None, pipeline::PipelineFlags::empty()));
+        }
+        self.require_features(wgt::Features::EXPERIMENTAL_WORK_GRAPHS_1_1)?;
+
+        let mut pass_context = None::<RenderPassContext>;
+        let mut flags = pipeline::PipelineFlags::empty();
+        for (index, node) in mesh_nodes.iter().enumerate() {
+            let node_error = |error| match error {
+                pipeline::CreatePipelineError::Render(error) => {
+                    pipeline::CreatePipelineError::WorkGraphMeshNode { node: index, error }
+                }
+                error => error,
+            };
+
+            let topology = node.primitive.topology;
+            if topology.is_strip() || node.primitive.strip_index_format.is_some() {
+                return Err(pipeline::CreatePipelineError::WorkGraphMeshNodeTopology {
+                    node: index,
+                    topology,
+                });
+            }
+
+            let color_targets = node
+                .fragment
+                .as_ref()
+                .map_or(&[][..], |fragment| &fragment.targets);
+            let depth_stencil_state = node.depth_stencil.as_ref();
+            self.validate_color_target_count(color_targets)
+                .map_err(node_error)?;
+            self.validate_render_targets(
+                &node.primitive,
+                color_targets,
+                depth_stencil_state,
+                &node.multisample,
+            )
+            .map_err(node_error)?;
+
+            let samples = node.multisample.count;
+            if samples == 0 || samples > 32 || !samples.is_power_of_two() {
+                return Err(node_error(
+                    pipeline::RenderError::InvalidSampleCount(samples).into(),
+                ));
+            }
+
+            let node_context = RenderPassContext {
+                attachments: AttachmentData {
+                    colors: color_targets
+                        .iter()
+                        .map(|state| state.as_ref().map(|s| s.format))
+                        .collect(),
+                    resolves: ArrayVec::new(),
+                    depth_stencil: depth_stencil_state.map(|state| state.format),
+                },
+                sample_count: samples,
+                multiview_mask: None,
+            };
+            match pass_context {
+                Some(ref context) if *context != node_context => {
+                    return Err(
+                        pipeline::CreatePipelineError::WorkGraphMeshNodeTargetsMismatch {
+                            node: index,
+                        },
+                    );
+                }
+                Some(_) => {}
+                None => pass_context = Some(node_context),
+            }
+
+            flags |=
+                render_pipeline_flags(color_targets, depth_stencil_state, node.primitive.cull_mode);
+        }
+
+        Ok((pass_context, flags))
     }
 
     /// Creates a render pipeline. If the creation fails,
@@ -4756,20 +4874,11 @@ impl Device {
         }
     }
 
-    fn create_render_pipeline_or_error_inner(
-        self: &Arc<Self>,
-        desc: pipeline::ResolvedGeneralRenderPipelineDescriptor,
-    ) -> Result<Arc<pipeline::RenderPipeline>, pipeline::CreatePipelineError> {
-        use wgt::TextureFormatFeatureFlags as Tfff;
-
-        self.check_is_valid()?;
-
-        let color_targets = desc
-            .fragment
-            .as_ref()
-            .map_or(&[][..], |fragment| &fragment.targets);
-        let depth_stencil_state = desc.depth_stencil.as_ref();
-
+    /// Checks the number of color targets and whether they need independent blending.
+    fn validate_color_target_count(
+        &self,
+        color_targets: &[Option<wgt::ColorTargetState>],
+    ) -> Result<(), pipeline::CreatePipelineError> {
         check_color_attachment_count(color_targets.len(), self.limits.max_color_attachments)?;
 
         {
@@ -4784,14 +4893,266 @@ impl Device {
                 self.require_downlevel_flags(wgt::DownlevelFlags::INDEPENDENT_BLEND)?;
             }
         }
+        Ok(())
+    }
+
+    /// Validates the render target states of a render pipeline or a work graph mesh node.
+    fn validate_render_targets(
+        &self,
+        primitive: &wgt::PrimitiveState,
+        color_targets: &[Option<wgt::ColorTargetState>],
+        depth_stencil_state: Option<&wgt::DepthStencilState>,
+        multisample: &wgt::MultisampleState,
+    ) -> Result<RenderTargetsInfo, pipeline::CreatePipelineError> {
+        use wgt::TextureFormatFeatureFlags as Tfff;
+
+        let mut dual_source_blending = false;
+        let mut has_depth_attachment = false;
+
+        if primitive.unclipped_depth {
+            self.require_features(wgt::Features::DEPTH_CLIP_CONTROL)?;
+        }
+
+        if primitive.polygon_mode == wgt::PolygonMode::Line {
+            self.require_features(wgt::Features::POLYGON_MODE_LINE)?;
+        }
+        if primitive.polygon_mode == wgt::PolygonMode::Point {
+            self.require_features(wgt::Features::POLYGON_MODE_POINT)?;
+        }
+
+        if primitive.conservative {
+            self.require_features(wgt::Features::CONSERVATIVE_RASTERIZATION)?;
+        }
+
+        if primitive.conservative && primitive.polygon_mode != wgt::PolygonMode::Fill {
+            return Err(pipeline::RenderError::ConservativeRasterizationNonFillPolygonMode.into());
+        }
+
+        let mut target_specified = false;
+        let mut required_color_outputs = 0u64;
+        const _: () = {
+            assert!(hal::MAX_COLOR_ATTACHMENTS <= 64);
+        };
+
+        for (i, cs) in color_targets.iter().enumerate() {
+            if let Some(cs) = cs.as_ref() {
+                target_specified = true;
+                let error = 'error: {
+                    // This is expected to be the operative check for illegal write mask
+                    // values (larger than 15), because WebGPU requires that it be validated
+                    // on the device timeline.
+                    if cs.write_mask.contains_unknown_bits() {
+                        break 'error Some(ColorStateError::InvalidWriteMask(cs.write_mask));
+                    } else if cs.write_mask != ColorWrites::NONE {
+                        required_color_outputs |= 1 << i;
+                    }
+
+                    let format_features = self.describe_format_features(cs.format)?;
+                    if !format_features
+                        .allowed_usages
+                        .contains(wgt::TextureUsages::RENDER_ATTACHMENT)
+                    {
+                        break 'error Some(ColorStateError::FormatNotRenderable(cs.format));
+                    }
+                    if cs.blend.is_some() && !format_features.flags.contains(Tfff::BLENDABLE) {
+                        break 'error Some(ColorStateError::FormatNotBlendable(cs.format));
+                    }
+                    if !hal::FormatAspects::from(cs.format).contains(hal::FormatAspects::COLOR) {
+                        break 'error Some(ColorStateError::FormatNotColor(cs.format));
+                    }
+
+                    if multisample.count > 1
+                        && !format_features
+                            .flags
+                            .sample_count_supported(multisample.count)
+                    {
+                        break 'error Some(ColorStateError::InvalidSampleCount(
+                            multisample.count,
+                            cs.format,
+                            cs.format
+                                .guaranteed_format_features(self.features)
+                                .flags
+                                .supported_sample_counts(),
+                            self.adapter
+                                .get_texture_format_features(cs.format)
+                                .flags
+                                .supported_sample_counts(),
+                        ));
+                    }
+
+                    if let Some(blend_mode) = cs.blend {
+                        for component in [&blend_mode.color, &blend_mode.alpha] {
+                            for factor in [component.src_factor, component.dst_factor] {
+                                if factor.uses_second_blend_source() {
+                                    self.require_features(wgt::Features::DUAL_SOURCE_BLENDING)?;
+                                    if i == 0 {
+                                        dual_source_blending = true;
+                                    } else {
+                                        break 'error Some(
+                                            ColorStateError::BlendFactorOnUnsupportedTarget {
+                                                factor,
+                                                target: i as u32,
+                                            },
+                                        );
+                                    }
+                                }
+
+                                if [wgt::BlendOperation::Min, wgt::BlendOperation::Max]
+                                    .contains(&component.operation)
+                                    && factor != wgt::BlendFactor::One
+                                {
+                                    break 'error Some(ColorStateError::InvalidMinMaxBlendFactor {
+                                        factor,
+                                        target: i as u32,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    break 'error None;
+                };
+                if let Some(e) = error {
+                    return Err(pipeline::RenderError::ColorState(i as u8, e).into());
+                }
+            }
+        }
+
+        if dual_source_blending && color_targets.len() > 1 {
+            return Err(
+                pipeline::RenderError::DualSourceBlendingWithMultipleColorTargets {
+                    count: color_targets.len(),
+                }
+                .into(),
+            );
+        }
+
+        validation::validate_color_attachment_bytes_per_sample(
+            color_targets.iter().flatten().map(|cs| cs.format),
+            self.limits.max_color_attachment_bytes_per_sample,
+        )
+        .map_err(pipeline::RenderError::ColorAttachment)?;
+
+        if let Some(ds) = depth_stencil_state {
+            // See <https://gpuweb.github.io/gpuweb/#abstract-opdef-validating-gpudepthstencilstate>.
+            target_specified = true;
+            let error = 'error: {
+                if !ds.format.is_depth_stencil_format() {
+                    // This error case is not redundant with the aspect check below when
+                    // neither depth nor stencil is enabled at all.
+                    break 'error Some(pipeline::DepthStencilStateError::FormatNotDepthOrStencil(
+                        ds.format,
+                    ));
+                }
+
+                let format_features = self.describe_format_features(ds.format)?;
+                if !format_features
+                    .allowed_usages
+                    .contains(wgt::TextureUsages::RENDER_ATTACHMENT)
+                {
+                    break 'error Some(pipeline::DepthStencilStateError::FormatNotRenderable(
+                        ds.format,
+                    ));
+                }
+
+                let aspect = hal::FormatAspects::from(ds.format);
+                if aspect.contains(hal::FormatAspects::DEPTH) {
+                    has_depth_attachment = true;
+                } else if ds.is_depth_enabled() {
+                    break 'error Some(pipeline::DepthStencilStateError::FormatNotDepth(ds.format));
+                }
+                if has_depth_attachment {
+                    let Some(depth_write_enabled) = ds.depth_write_enabled else {
+                        break 'error Some(
+                            pipeline::DepthStencilStateError::MissingDepthWriteEnabled(ds.format),
+                        );
+                    };
+
+                    let depth_compare_required = depth_write_enabled
+                        || ds.stencil.front.depth_fail_op != wgt::StencilOperation::Keep
+                        || ds.stencil.back.depth_fail_op != wgt::StencilOperation::Keep;
+                    if depth_compare_required && ds.depth_compare.is_none() {
+                        break 'error Some(pipeline::DepthStencilStateError::MissingDepthCompare(
+                            ds.format,
+                        ));
+                    }
+                }
+
+                if ds.stencil.is_enabled() && !aspect.contains(hal::FormatAspects::STENCIL) {
+                    break 'error Some(pipeline::DepthStencilStateError::FormatNotStencil(
+                        ds.format,
+                    ));
+                }
+                if multisample.count > 1
+                    && !format_features
+                        .flags
+                        .sample_count_supported(multisample.count)
+                {
+                    break 'error Some(pipeline::DepthStencilStateError::InvalidSampleCount(
+                        multisample.count,
+                        ds.format,
+                        ds.format
+                            .guaranteed_format_features(self.features)
+                            .flags
+                            .supported_sample_counts(),
+                        self.adapter
+                            .get_texture_format_features(ds.format)
+                            .flags
+                            .supported_sample_counts(),
+                    ));
+                }
+
+                break 'error None;
+            };
+            if let Some(e) = error {
+                return Err(pipeline::RenderError::DepthStencilState(e).into());
+            }
+
+            if ds.bias.clamp != 0.0 {
+                self.require_downlevel_flags(wgt::DownlevelFlags::DEPTH_BIAS_CLAMP)?;
+            }
+
+            if (ds.bias.is_enabled() || ds.bias.clamp != 0.0) && !primitive.topology.is_triangles()
+            {
+                return Err(pipeline::RenderError::DepthStencilState(
+                    pipeline::DepthStencilStateError::DepthBiasWithIncompatibleTopology(
+                        primitive.topology,
+                    ),
+                )
+                .into());
+            }
+        }
+
+        if !target_specified {
+            return Err(pipeline::RenderError::NoTargetSpecified.into());
+        }
+
+        Ok(RenderTargetsInfo {
+            required_color_outputs,
+            dual_source_blending,
+            has_depth_attachment,
+        })
+    }
+
+    fn create_render_pipeline_or_error_inner(
+        self: &Arc<Self>,
+        desc: pipeline::ResolvedGeneralRenderPipelineDescriptor,
+    ) -> Result<Arc<pipeline::RenderPipeline>, pipeline::CreatePipelineError> {
+        self.check_is_valid()?;
+
+        let color_targets = desc
+            .fragment
+            .as_ref()
+            .map_or(&[][..], |fragment| &fragment.targets);
+        let depth_stencil_state = desc.depth_stencil.as_ref();
+
+        self.validate_color_target_count(color_targets)?;
 
         let mut io = validation::StageIo::default();
 
         let mut vertex_steps;
         let mut hal_vertex_buffer_layouts;
         let mut total_attributes;
-        let mut dual_source_blending = false;
-        let mut has_depth_attachment = false;
         if let pipeline::RenderPipelineVertexProcessor::Vertex(ref vertex) = desc.vertex {
             if vertex.buffers.len() > self.limits.max_vertex_buffers as usize {
                 return Err(pipeline::RenderError::TooManyVertexBuffers {
@@ -4933,224 +5294,16 @@ impl Device {
             .into());
         }
 
-        if desc.primitive.unclipped_depth {
-            self.require_features(wgt::Features::DEPTH_CLIP_CONTROL)?;
-        }
-
-        if desc.primitive.polygon_mode == wgt::PolygonMode::Line {
-            self.require_features(wgt::Features::POLYGON_MODE_LINE)?;
-        }
-        if desc.primitive.polygon_mode == wgt::PolygonMode::Point {
-            self.require_features(wgt::Features::POLYGON_MODE_POINT)?;
-        }
-
-        if desc.primitive.conservative {
-            self.require_features(wgt::Features::CONSERVATIVE_RASTERIZATION)?;
-        }
-
-        if desc.primitive.conservative && desc.primitive.polygon_mode != wgt::PolygonMode::Fill {
-            return Err(pipeline::RenderError::ConservativeRasterizationNonFillPolygonMode.into());
-        }
-
-        let mut target_specified = false;
-        let mut required_color_outputs = 0u64;
-        const _: () = {
-            assert!(hal::MAX_COLOR_ATTACHMENTS <= 64);
-        };
-
-        for (i, cs) in color_targets.iter().enumerate() {
-            if let Some(cs) = cs.as_ref() {
-                target_specified = true;
-                let error = 'error: {
-                    // This is expected to be the operative check for illegal write mask
-                    // values (larger than 15), because WebGPU requires that it be validated
-                    // on the device timeline.
-                    if cs.write_mask.contains_unknown_bits() {
-                        break 'error Some(ColorStateError::InvalidWriteMask(cs.write_mask));
-                    } else if cs.write_mask != ColorWrites::NONE {
-                        required_color_outputs |= 1 << i;
-                    }
-
-                    let format_features = self.describe_format_features(cs.format)?;
-                    if !format_features
-                        .allowed_usages
-                        .contains(wgt::TextureUsages::RENDER_ATTACHMENT)
-                    {
-                        break 'error Some(ColorStateError::FormatNotRenderable(cs.format));
-                    }
-                    if cs.blend.is_some() && !format_features.flags.contains(Tfff::BLENDABLE) {
-                        break 'error Some(ColorStateError::FormatNotBlendable(cs.format));
-                    }
-                    if !hal::FormatAspects::from(cs.format).contains(hal::FormatAspects::COLOR) {
-                        break 'error Some(ColorStateError::FormatNotColor(cs.format));
-                    }
-
-                    if desc.multisample.count > 1
-                        && !format_features
-                            .flags
-                            .sample_count_supported(desc.multisample.count)
-                    {
-                        break 'error Some(ColorStateError::InvalidSampleCount(
-                            desc.multisample.count,
-                            cs.format,
-                            cs.format
-                                .guaranteed_format_features(self.features)
-                                .flags
-                                .supported_sample_counts(),
-                            self.adapter
-                                .get_texture_format_features(cs.format)
-                                .flags
-                                .supported_sample_counts(),
-                        ));
-                    }
-
-                    if let Some(blend_mode) = cs.blend {
-                        for component in [&blend_mode.color, &blend_mode.alpha] {
-                            for factor in [component.src_factor, component.dst_factor] {
-                                if factor.uses_second_blend_source() {
-                                    self.require_features(wgt::Features::DUAL_SOURCE_BLENDING)?;
-                                    if i == 0 {
-                                        dual_source_blending = true;
-                                    } else {
-                                        break 'error Some(
-                                            ColorStateError::BlendFactorOnUnsupportedTarget {
-                                                factor,
-                                                target: i as u32,
-                                            },
-                                        );
-                                    }
-                                }
-
-                                if [wgt::BlendOperation::Min, wgt::BlendOperation::Max]
-                                    .contains(&component.operation)
-                                    && factor != wgt::BlendFactor::One
-                                {
-                                    break 'error Some(ColorStateError::InvalidMinMaxBlendFactor {
-                                        factor,
-                                        target: i as u32,
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    break 'error None;
-                };
-                if let Some(e) = error {
-                    return Err(pipeline::RenderError::ColorState(i as u8, e).into());
-                }
-            }
-        }
-
-        if dual_source_blending && color_targets.len() > 1 {
-            return Err(
-                pipeline::RenderError::DualSourceBlendingWithMultipleColorTargets {
-                    count: color_targets.len(),
-                }
-                .into(),
-            );
-        }
-
-        validation::validate_color_attachment_bytes_per_sample(
-            color_targets.iter().flatten().map(|cs| cs.format),
-            self.limits.max_color_attachment_bytes_per_sample,
-        )
-        .map_err(pipeline::RenderError::ColorAttachment)?;
-
-        if let Some(ds) = depth_stencil_state {
-            // See <https://gpuweb.github.io/gpuweb/#abstract-opdef-validating-gpudepthstencilstate>.
-            target_specified = true;
-            let error = 'error: {
-                if !ds.format.is_depth_stencil_format() {
-                    // This error case is not redundant with the aspect check below when
-                    // neither depth nor stencil is enabled at all.
-                    break 'error Some(pipeline::DepthStencilStateError::FormatNotDepthOrStencil(
-                        ds.format,
-                    ));
-                }
-
-                let format_features = self.describe_format_features(ds.format)?;
-                if !format_features
-                    .allowed_usages
-                    .contains(wgt::TextureUsages::RENDER_ATTACHMENT)
-                {
-                    break 'error Some(pipeline::DepthStencilStateError::FormatNotRenderable(
-                        ds.format,
-                    ));
-                }
-
-                let aspect = hal::FormatAspects::from(ds.format);
-                if aspect.contains(hal::FormatAspects::DEPTH) {
-                    has_depth_attachment = true;
-                } else if ds.is_depth_enabled() {
-                    break 'error Some(pipeline::DepthStencilStateError::FormatNotDepth(ds.format));
-                }
-                if has_depth_attachment {
-                    let Some(depth_write_enabled) = ds.depth_write_enabled else {
-                        break 'error Some(
-                            pipeline::DepthStencilStateError::MissingDepthWriteEnabled(ds.format),
-                        );
-                    };
-
-                    let depth_compare_required = depth_write_enabled
-                        || ds.stencil.front.depth_fail_op != wgt::StencilOperation::Keep
-                        || ds.stencil.back.depth_fail_op != wgt::StencilOperation::Keep;
-                    if depth_compare_required && ds.depth_compare.is_none() {
-                        break 'error Some(pipeline::DepthStencilStateError::MissingDepthCompare(
-                            ds.format,
-                        ));
-                    }
-                }
-
-                if ds.stencil.is_enabled() && !aspect.contains(hal::FormatAspects::STENCIL) {
-                    break 'error Some(pipeline::DepthStencilStateError::FormatNotStencil(
-                        ds.format,
-                    ));
-                }
-                if desc.multisample.count > 1
-                    && !format_features
-                        .flags
-                        .sample_count_supported(desc.multisample.count)
-                {
-                    break 'error Some(pipeline::DepthStencilStateError::InvalidSampleCount(
-                        desc.multisample.count,
-                        ds.format,
-                        ds.format
-                            .guaranteed_format_features(self.features)
-                            .flags
-                            .supported_sample_counts(),
-                        self.adapter
-                            .get_texture_format_features(ds.format)
-                            .flags
-                            .supported_sample_counts(),
-                    ));
-                }
-
-                break 'error None;
-            };
-            if let Some(e) = error {
-                return Err(pipeline::RenderError::DepthStencilState(e).into());
-            }
-
-            if ds.bias.clamp != 0.0 {
-                self.require_downlevel_flags(wgt::DownlevelFlags::DEPTH_BIAS_CLAMP)?;
-            }
-
-            if (ds.bias.is_enabled() || ds.bias.clamp != 0.0)
-                && !desc.primitive.topology.is_triangles()
-            {
-                return Err(pipeline::RenderError::DepthStencilState(
-                    pipeline::DepthStencilStateError::DepthBiasWithIncompatibleTopology(
-                        desc.primitive.topology,
-                    ),
-                )
-                .into());
-            }
-        }
-
-        if !target_specified {
-            return Err(pipeline::RenderError::NoTargetSpecified.into());
-        }
+        let RenderTargetsInfo {
+            required_color_outputs,
+            dual_source_blending,
+            has_depth_attachment,
+        } = self.validate_render_targets(
+            &desc.primitive,
+            color_targets,
+            depth_stencil_state,
+            &desc.multisample,
+        )?;
 
         let is_auto_layout = desc.layout.is_none();
 
@@ -5387,25 +5540,8 @@ impl Device {
             multiview_mask: desc.multiview_mask,
         };
 
-        let mut flags = pipeline::PipelineFlags::empty();
-        for state in color_targets.iter().filter_map(|s| s.as_ref()) {
-            if let Some(ref bs) = state.blend {
-                if bs.color.uses_constant() | bs.alpha.uses_constant() {
-                    flags |= pipeline::PipelineFlags::BLEND_CONSTANT;
-                }
-            }
-        }
-        if let Some(ds) = depth_stencil_state.as_ref() {
-            if ds.stencil.is_enabled() && ds.stencil.needs_ref_value() {
-                flags |= pipeline::PipelineFlags::STENCIL_REFERENCE;
-            }
-            if !ds.is_depth_read_only() {
-                flags |= pipeline::PipelineFlags::WRITES_DEPTH;
-            }
-            if !ds.is_stencil_read_only(desc.primitive.cull_mode) {
-                flags |= pipeline::PipelineFlags::WRITES_STENCIL;
-            }
-        }
+        let flags =
+            render_pipeline_flags(color_targets, depth_stencil_state, desc.primitive.cull_mode);
         let shader_modules = {
             let mut shader_modules = ArrayVec::new();
             match desc.vertex {
@@ -5800,3 +5936,38 @@ impl Device {
 crate::impl_resource_type!(Device);
 crate::impl_labeled!(Device);
 crate::impl_storage_item!(Device);
+
+fn render_pipeline_flags(
+    color_targets: &[Option<wgt::ColorTargetState>],
+    depth_stencil_state: Option<&wgt::DepthStencilState>,
+    cull_mode: Option<wgt::Face>,
+) -> pipeline::PipelineFlags {
+    let mut flags = pipeline::PipelineFlags::empty();
+    for state in color_targets.iter().filter_map(|s| s.as_ref()) {
+        if let Some(ref bs) = state.blend {
+            if bs.color.uses_constant() | bs.alpha.uses_constant() {
+                flags |= pipeline::PipelineFlags::BLEND_CONSTANT;
+            }
+        }
+    }
+    if let Some(ds) = depth_stencil_state {
+        if ds.stencil.is_enabled() && ds.stencil.needs_ref_value() {
+            flags |= pipeline::PipelineFlags::STENCIL_REFERENCE;
+        }
+        if !ds.is_depth_read_only() {
+            flags |= pipeline::PipelineFlags::WRITES_DEPTH;
+        }
+        if !ds.is_stencil_read_only(cull_mode) {
+            flags |= pipeline::PipelineFlags::WRITES_STENCIL;
+        }
+    }
+    flags
+}
+
+/// Information about the render targets of a pipeline, from [`Device::validate_render_targets`].
+struct RenderTargetsInfo {
+    /// Bit mask of the color targets that have a non-empty write mask.
+    required_color_outputs: u64,
+    dual_source_blending: bool,
+    has_depth_attachment: bool,
+}

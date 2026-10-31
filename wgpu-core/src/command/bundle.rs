@@ -551,6 +551,8 @@ impl RenderBundleEncoder {
                     unimplemented!("not supported by a render bundle")
                 }
                 RenderCommand::ExecuteBundle(_)
+                | RenderCommand::SetWorkGraphPipeline { .. }
+                | RenderCommand::DispatchGraph { .. }
                 | RenderCommand::SetBlendConstant(_)
                 | RenderCommand::SetStencilReference(_)
                 | RenderCommand::SetViewport { .. }
@@ -1706,6 +1708,8 @@ impl RenderBundle {
                     unreachable!("query commands are not supported in render bundles")
                 }
                 Cmd::ExecuteBundle(_)
+                | Cmd::SetWorkGraphPipeline { .. }
+                | Cmd::DispatchGraph { .. }
                 | Cmd::SetBlendConstant(_)
                 | Cmd::SetStencilReference(_)
                 | Cmd::SetViewport { .. }

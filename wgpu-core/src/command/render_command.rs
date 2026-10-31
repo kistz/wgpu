@@ -19,6 +19,12 @@ pub enum RenderCommand<R: ReferenceType> {
         bind_group: Option<R::BindGroup>,
     },
     SetPipeline(R::RenderPipeline),
+    SetWorkGraphPipeline {
+        pipeline: R::WorkGraphPipeline,
+        backing_memory: R::Buffer,
+        offset: BufferAddress,
+        size: Option<BufferAddress>,
+    },
     SetIndexBuffer {
         buffer: R::Buffer,
         index_format: wgt::IndexFormat,
@@ -70,6 +76,9 @@ pub enum RenderCommand<R: ReferenceType> {
         group_count_x: u32,
         group_count_y: u32,
         group_count_z: u32,
+    },
+    DispatchGraph {
+        inputs: Vec<wgt::WorkGraphNodeInput<Vec<u8>>>,
     },
     DrawIndirect {
         buffer: R::Buffer,

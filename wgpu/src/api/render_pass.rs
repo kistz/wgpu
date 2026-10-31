@@ -87,6 +87,44 @@ impl RenderPass<'_> {
         self.inner.set_pipeline(&pipeline.inner);
     }
 
+    /// Sets the active work graph pipeline and the buffer region holding its backing memory.
+    ///
+    /// The work graph must have mesh nodes, which must render to the attachments of this pass.
+    /// This replaces the active render pipeline.
+    ///
+    /// The backing memory's buffer must have [`BufferUsages::STORAGE`], its offset must be a
+    /// multiple of [`WORK_GRAPH_BACKING_MEMORY_ALIGNMENT`], and its size must be at least
+    /// [`WorkGraphMemoryRequirements::min_size`]. Its contents are overwritten. The buffer cannot
+    /// be used in any other way in this pass.
+    ///
+    /// Requires [`Features::EXPERIMENTAL_WORK_GRAPHS_1_1`].
+    pub fn set_work_graph_pipeline(
+        &mut self,
+        pipeline: &WorkGraphPipeline,
+        backing_memory: BufferSlice<'_>,
+    ) {
+        self.inner.set_work_graph_pipeline(
+            &pipeline.inner,
+            &backing_memory.buffer.inner,
+            backing_memory.offset,
+            backing_memory.size,
+        );
+    }
+
+    /// Submits input records to entrypoints of the active work graph pipeline.
+    ///
+    /// Each input targets the entrypoint at its index in [`WorkGraphPipeline::entrypoints`].
+    /// Records use C struct layout rules. They are copied when this is called. The input must
+    /// not exceed the pipeline's [`WorkGraphPipelineDescriptor::max_input_records`].
+    ///
+    /// # Safety
+    ///
+    /// The records must not violate limits declared by the nodes receiving them. For example,
+    /// an `SV_DispatchGrid` value must not exceed the node's `NodeMaxDispatchGrid`.
+    pub unsafe fn dispatch_graph(&mut self, inputs: &[WorkGraphNodeInput<&[u8]>]) {
+        unsafe { self.inner.dispatch_graph(inputs) };
+    }
+
     /// Sets the blend color as used by some of the blending modes.
     ///
     /// Subsequent blending tests will test against this value.

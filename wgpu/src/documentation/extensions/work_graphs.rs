@@ -76,6 +76,8 @@ let pipeline = device.create_work_graph_pipeline(&wgpu::WorkGraphPipelineDescrip
     program_name: "graph",
     entrypoints: &[],
     include_all_available_nodes: true,
+    mesh_nodes: &[],
+    max_input_records: None,
 });
 
 let backing_memory = device.create_buffer(&wgpu::BufferDescriptor {
@@ -118,15 +120,41 @@ unsafe {
 }
 ```
 
+## Mesh nodes
+
+With [`Features::EXPERIMENTAL_WORK_GRAPHS_1_1`], a work graph can contain mesh nodes, which are
+leaf nodes that draw like mesh shaders. D3D12 only supports them in preview Agility SDKs, on
+drivers that report work graphs tier 1.1. Node shaders with `[NodeLaunch("mesh")]` need a DXC
+version with mesh node support, so precompiled DXIL may be the easier option.
+
+Each [`WorkGraphMeshNode`] names a mesh node shader and an optional fragment shader in the
+shader library, and has the same primitive, depth-stencil and multisample state as a render
+pipeline. The node's ID in the work graph is [`WorkGraphMeshNode::node`], and other nodes send
+records to it by that ID. All mesh nodes of a work graph must render to the same attachment
+formats with the same sample count.
+
+A work graph with mesh nodes runs in a [`RenderPass`] whose attachments match the mesh nodes,
+with [`RenderPass::set_work_graph_pipeline`] and [`RenderPass::dispatch_graph`]. All nodes use the
+bind groups and immediates of the render pass, so the visibility of a bind group layout must
+include every stage that uses it: `COMPUTE` for compute nodes, `MESH` for mesh nodes and
+`FRAGMENT` for fragment shaders. Setting the work graph replaces the render pipeline, so a render
+pipeline must be set again before the next draw.
+
+D3D12 needs to know the size of the largest dispatch to compute the backing memory size, so
+[`WorkGraphPipelineDescriptor::max_input_records`] is required with mesh nodes, and every
+[`RenderPass::dispatch_graph`] call must stay within it.
+
 ## Not yet supported
 
 - Overriding node properties in the work graph description.
-- Mesh nodes.
+- Input in GPU memory for work graphs with mesh nodes.
+- Work graphs in render bundles.
 
 [D3D12 work graphs]: https://microsoft.github.io/DirectX-Specs/d3d/WorkGraphs.html
 */
 
 use crate::{
     Buffer, BufferUsages, ComputePass, Device, Dx12BackendOptions, Features, PipelineLayout,
-    WorkGraphGpuMultiNodeInput, WorkGraphGpuNodeInput, WorkGraphPipeline,
+    RenderPass, WorkGraphGpuMultiNodeInput, WorkGraphGpuNodeInput, WorkGraphMeshNode,
+    WorkGraphPipeline, WorkGraphPipelineDescriptor,
 };

@@ -45,6 +45,16 @@ pub struct WorkGraphMemoryRequirements {
     pub size_granularity: BufferAddress,
 }
 
+/// Upper bounds on the input of a single dispatch of a work graph with mesh nodes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct WorkGraphMaxInputRecords {
+    /// Maximum number of records summed over all inputs of a dispatch.
+    pub records: u32,
+    /// Maximum number of inputs of a dispatch.
+    pub node_inputs: u32,
+}
+
 /// An entrypoint of a work graph.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]

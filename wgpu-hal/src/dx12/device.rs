@@ -20,7 +20,7 @@ use windows::{
     },
 };
 
-use super::{conv, descriptor, D3D12Lib};
+use super::{conv, descriptor, work_graph_preview, D3D12Lib};
 use crate::{
     auxil::{
         self,
@@ -2420,6 +2420,47 @@ impl crate::Device for super::Device {
                 borrow_optional_interface_temporarily(&desc.layout.shared.signature)
             },
         };
+        // Mesh nodes take their root arguments from the graphics state of a render pass.
+        let state_object_config = Direct3D12::D3D12_STATE_OBJECT_CONFIG {
+            Flags: work_graph_preview::D3D12_STATE_OBJECT_FLAG_WORK_GRAPHS_USE_GRAPHICS_STATE_FOR_GLOBAL_ROOT_SIGNATURE,
+        };
+
+        let mesh_node_programs = desc
+            .mesh_nodes
+            .iter()
+            .map(MeshNodeProgram::new)
+            .collect::<Vec<_>>();
+        let mesh_launch_overrides = mesh_node_programs
+            .iter()
+            .map(|program| work_graph_preview::MeshLaunchOverrides {
+                local_root_arguments_table_index: ptr::null(),
+                program_entry: ptr::null(),
+                new_name: program.node_id.as_ref().map_or(ptr::null(), ptr::from_ref),
+                share_input_of: ptr::null(),
+                dispatch_grid: ptr::null(),
+                max_dispatch_grid: ptr::null(),
+                max_input_records_per_graph_entry_record: ptr::null(),
+            })
+            .collect::<Vec<_>>();
+        let program_nodes = mesh_node_programs
+            .iter()
+            .zip(&mesh_launch_overrides)
+            .map(|(program, overrides)| work_graph_preview::ProgramNode {
+                node_type: work_graph_preview::D3D12_NODE_TYPE_PROGRAM,
+                program: PCWSTR(program.name.as_ptr()),
+                overrides_type: if program.node_id.is_some() {
+                    work_graph_preview::D3D12_PROGRAM_NODE_OVERRIDES_TYPE_MESH_LAUNCH
+                } else {
+                    work_graph_preview::D3D12_PROGRAM_NODE_OVERRIDES_TYPE_NONE
+                },
+                overrides: if program.node_id.is_some() {
+                    ptr::from_ref(overrides)
+                } else {
+                    ptr::null()
+                },
+            })
+            .collect::<Vec<_>>();
+
         let work_graph_desc = Direct3D12::D3D12_WORK_GRAPH_DESC {
             ProgramName: PCWSTR(program_name.as_ptr()),
             Flags: if desc.include_all_available_nodes {
@@ -2429,23 +2470,70 @@ impl crate::Device for super::Device {
             },
             NumEntrypoints: entrypoints.len() as u32,
             pEntrypoints: entrypoints.as_ptr(),
-            NumExplicitlyDefinedNodes: 0,
-            pExplicitlyDefinedNodes: ptr::null(),
+            NumExplicitlyDefinedNodes: program_nodes.len() as u32,
+            pExplicitlyDefinedNodes: if program_nodes.is_empty() {
+                ptr::null()
+            } else {
+                program_nodes.as_ptr().cast()
+            },
         };
-        let subobjects = [
-            Direct3D12::D3D12_STATE_SUBOBJECT {
-                Type: Direct3D12::D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY,
-                pDesc: ptr::from_ref(&library_desc).cast(),
-            },
-            Direct3D12::D3D12_STATE_SUBOBJECT {
-                Type: Direct3D12::D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE,
-                pDesc: ptr::from_ref(&root_signature_desc).cast(),
-            },
-            Direct3D12::D3D12_STATE_SUBOBJECT {
-                Type: Direct3D12::D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH,
-                pDesc: ptr::from_ref(&work_graph_desc).cast(),
-            },
-        ];
+
+        // Generic programs point to their subobjects in `subobjects`, so it must not reallocate.
+        let subobject_capacity =
+            4 + mesh_node_programs.len() * (MeshNodeProgram::SUBOBJECT_COUNT + 1);
+        let mut subobjects = Vec::with_capacity(subobject_capacity);
+        subobjects.push(Direct3D12::D3D12_STATE_SUBOBJECT {
+            Type: Direct3D12::D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY,
+            pDesc: ptr::from_ref(&library_desc).cast(),
+        });
+        subobjects.push(Direct3D12::D3D12_STATE_SUBOBJECT {
+            Type: Direct3D12::D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE,
+            pDesc: ptr::from_ref(&root_signature_desc).cast(),
+        });
+        if !mesh_node_programs.is_empty() {
+            subobjects.push(Direct3D12::D3D12_STATE_SUBOBJECT {
+                Type: Direct3D12::D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG,
+                pDesc: ptr::from_ref(&state_object_config).cast(),
+            });
+        }
+        let mut program_subobject_starts = Vec::with_capacity(mesh_node_programs.len());
+        for program in &mesh_node_programs {
+            program_subobject_starts.push(subobjects.len());
+            subobjects.extend(program.subobjects());
+        }
+        let program_subobjects = program_subobject_starts
+            .iter()
+            .map(|&start| {
+                (start..start + MeshNodeProgram::SUBOBJECT_COUNT)
+                    .map(|index| unsafe { subobjects.as_ptr().add(index) })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let generic_programs = mesh_node_programs
+            .iter()
+            .zip(&program_subobjects)
+            .map(
+                |(program, program_subobjects)| Direct3D12::D3D12_GENERIC_PROGRAM_DESC {
+                    ProgramName: PCWSTR(program.name.as_ptr()),
+                    NumExports: program.exports.len() as u32,
+                    pExports: program.exports.as_ptr(),
+                    NumSubobjects: program_subobjects.len() as u32,
+                    ppSubobjects: program_subobjects.as_ptr(),
+                },
+            )
+            .collect::<Vec<_>>();
+        for generic_program in &generic_programs {
+            subobjects.push(Direct3D12::D3D12_STATE_SUBOBJECT {
+                Type: Direct3D12::D3D12_STATE_SUBOBJECT_TYPE_GENERIC_PROGRAM,
+                pDesc: ptr::from_ref(generic_program).cast(),
+            });
+        }
+        subobjects.push(Direct3D12::D3D12_STATE_SUBOBJECT {
+            Type: Direct3D12::D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH,
+            pDesc: ptr::from_ref(&work_graph_desc).cast(),
+        });
+        debug_assert_eq!(subobjects.capacity(), subobject_capacity);
+
         let state_object_desc = Direct3D12::D3D12_STATE_OBJECT_DESC {
             Type: Direct3D12::D3D12_STATE_OBJECT_TYPE_EXECUTABLE,
             NumSubobjects: subobjects.len() as u32,
@@ -2509,6 +2597,17 @@ impl crate::Device for super::Device {
                 }
             })
             .collect();
+
+        if !desc.mesh_nodes.is_empty() {
+            let max = desc.max_input_records.unwrap_or_default();
+            work_graph_preview::set_maximum_input_records(
+                &properties,
+                graph_index,
+                max.records,
+                max.node_inputs,
+            )
+            .map_err(to_pipeline_error)?;
+        }
 
         let mut memory_requirements = Direct3D12::D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS::default();
         unsafe { properties.GetWorkGraphMemoryRequirements(graph_index, &mut memory_requirements) };
@@ -2965,5 +3064,185 @@ impl crate::Device for super::Device {
         }
 
         Ok(())
+    }
+}
+
+/// A generic program that holds a work graph mesh node and the graphics state it draws with.
+struct MeshNodeProgram {
+    name: windows::core::HSTRING,
+    _export_names: Vec<windows::core::HSTRING>,
+    exports: Vec<windows::core::PCWSTR>,
+    _node_name: windows::core::HSTRING,
+    /// The node ID, if it differs from the program name.
+    node_id: Option<Direct3D12::D3D12_NODE_ID>,
+    rasterizer: Direct3D12::D3D12_RASTERIZER_DESC2,
+    blend: Direct3D12::D3D12_BLEND_DESC,
+    depth_stencil: Direct3D12::D3D12_DEPTH_STENCIL_DESC,
+    render_target_formats: Direct3D12::D3D12_RT_FORMAT_ARRAY,
+    depth_stencil_format: Dxgi::Common::DXGI_FORMAT,
+    sample_desc: Dxgi::Common::DXGI_SAMPLE_DESC,
+    sample_mask: u32,
+    primitive_topology: Direct3D12::D3D12_PRIMITIVE_TOPOLOGY_TYPE,
+}
+
+impl MeshNodeProgram {
+    const SUBOBJECT_COUNT: usize = 8;
+
+    fn new(node: &crate::WorkGraphMeshNode<'_>) -> Self {
+        use windows::core::{HSTRING, PCWSTR};
+
+        // The ID of a program node is its program name with array index 0, so other array
+        // indices need a different program name.
+        let node_name = HSTRING::from(&*node.node.name);
+        let (name, node_id) = if node.node.array_index == 0 {
+            (node_name.clone(), None)
+        } else {
+            (
+                HSTRING::from(alloc::format!(
+                    "{}[{}]",
+                    node.node.name,
+                    node.node.array_index
+                )),
+                Some(Direct3D12::D3D12_NODE_ID {
+                    Name: PCWSTR(node_name.as_ptr()),
+                    ArrayIndex: node.node.array_index,
+                }),
+            )
+        };
+
+        let export_names = core::iter::once(node.mesh_entry_point)
+            .chain(node.fragment_entry_point)
+            .map(HSTRING::from)
+            .collect::<Vec<_>>();
+        let exports = export_names
+            .iter()
+            .map(|name| PCWSTR(name.as_ptr()))
+            .collect();
+
+        let bias = node
+            .depth_stencil
+            .as_ref()
+            .map(|ds| ds.bias)
+            .unwrap_or_default();
+        let rasterizer = Direct3D12::D3D12_RASTERIZER_DESC2 {
+            FillMode: conv::map_polygon_mode(node.primitive.polygon_mode),
+            CullMode: match node.primitive.cull_mode {
+                None => Direct3D12::D3D12_CULL_MODE_NONE,
+                Some(wgt::Face::Front) => Direct3D12::D3D12_CULL_MODE_FRONT,
+                Some(wgt::Face::Back) => Direct3D12::D3D12_CULL_MODE_BACK,
+            },
+            FrontCounterClockwise: match node.primitive.front_face {
+                wgt::FrontFace::Cw => Foundation::FALSE,
+                wgt::FrontFace::Ccw => Foundation::TRUE,
+            },
+            DepthBias: bias.constant as f32,
+            DepthBiasClamp: bias.clamp,
+            SlopeScaledDepthBias: bias.slope_scale,
+            DepthClipEnable: windows_core::BOOL::from(!node.primitive.unclipped_depth),
+            LineRasterizationMode: if node.multisample.count > 1 {
+                Direct3D12::D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_WIDE
+            } else {
+                Direct3D12::D3D12_LINE_RASTERIZATION_MODE_ALIASED
+            },
+            ForcedSampleCount: 0,
+            ConservativeRaster: if node.primitive.conservative {
+                Direct3D12::D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON
+            } else {
+                Direct3D12::D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF
+            },
+        };
+
+        let mut render_target_formats = Direct3D12::D3D12_RT_FORMAT_ARRAY {
+            RTFormats: [Dxgi::Common::DXGI_FORMAT_UNKNOWN; 8],
+            NumRenderTargets: node.color_targets.len() as u32,
+        };
+        for (format, target) in render_target_formats
+            .RTFormats
+            .iter_mut()
+            .zip(node.color_targets)
+        {
+            if let Some(target) = target {
+                *format = auxil::dxgi::conv::map_texture_format(target.format);
+            }
+        }
+
+        Self {
+            name,
+            _export_names: export_names,
+            exports,
+            _node_name: node_name,
+            node_id,
+            rasterizer,
+            blend: Direct3D12::D3D12_BLEND_DESC {
+                AlphaToCoverageEnable: windows_core::BOOL::from(
+                    node.multisample.alpha_to_coverage_enabled,
+                ),
+                IndependentBlendEnable: true.into(),
+                RenderTarget: conv::map_render_targets(node.color_targets),
+            },
+            // The default depth stencil state enables the depth test, so always provide one.
+            depth_stencil: node
+                .depth_stencil
+                .as_ref()
+                .map_or_else(Default::default, conv::map_depth_stencil),
+            render_target_formats,
+            depth_stencil_format: node
+                .depth_stencil
+                .as_ref()
+                .map_or(Dxgi::Common::DXGI_FORMAT_UNKNOWN, |ds| {
+                    auxil::dxgi::conv::map_texture_format(ds.format)
+                }),
+            sample_desc: Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: node.multisample.count,
+                Quality: 0,
+            },
+            sample_mask: node.multisample.mask as u32,
+            primitive_topology: conv::map_topology(node.primitive.topology).0,
+        }
+    }
+
+    /// The graphics state subobjects of the program, which point into `self`.
+    fn subobjects(&self) -> [Direct3D12::D3D12_STATE_SUBOBJECT; Self::SUBOBJECT_COUNT] {
+        fn subobject<T>(
+            ty: Direct3D12::D3D12_STATE_SUBOBJECT_TYPE,
+            desc: &T,
+        ) -> Direct3D12::D3D12_STATE_SUBOBJECT {
+            Direct3D12::D3D12_STATE_SUBOBJECT {
+                Type: ty,
+                pDesc: ptr::from_ref(desc).cast(),
+            }
+        }
+
+        [
+            subobject(
+                Direct3D12::D3D12_STATE_SUBOBJECT_TYPE_RASTERIZER,
+                &self.rasterizer,
+            ),
+            subobject(Direct3D12::D3D12_STATE_SUBOBJECT_TYPE_BLEND, &self.blend),
+            subobject(
+                Direct3D12::D3D12_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL,
+                &self.depth_stencil,
+            ),
+            subobject(
+                Direct3D12::D3D12_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+                &self.render_target_formats,
+            ),
+            subobject(
+                Direct3D12::D3D12_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
+                &self.depth_stencil_format,
+            ),
+            subobject(
+                Direct3D12::D3D12_STATE_SUBOBJECT_TYPE_SAMPLE_DESC,
+                &self.sample_desc,
+            ),
+            subobject(
+                Direct3D12::D3D12_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
+                &self.sample_mask,
+            ),
+            subobject(
+                Direct3D12::D3D12_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+                &self.primitive_topology,
+            ),
+        ]
     }
 }

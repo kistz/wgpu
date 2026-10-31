@@ -526,6 +526,8 @@ impl<D: Device + DynResource> DynDevice for D {
             program_name: desc.program_name,
             entrypoints: desc.entrypoints,
             include_all_available_nodes: desc.include_all_available_nodes,
+            mesh_nodes: desc.mesh_nodes,
+            max_input_records: desc.max_input_records,
         };
 
         unsafe { D::create_work_graph_pipeline(self, &desc) }.map(

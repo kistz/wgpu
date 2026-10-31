@@ -706,18 +706,21 @@ impl super::Adapter {
             wgt::Features::EXPERIMENTAL_MESH_SHADER,
             mesh_shader_supported,
         );
-        let work_graphs_tier_supported = {
+        let work_graphs_tier = {
             let mut features21 = Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS21::default();
-            unsafe {
+            match unsafe {
                 device.CheckFeatureSupport(
                     Direct3D12::D3D12_FEATURE_D3D12_OPTIONS21,
                     <*mut _>::cast(&mut features21),
                     size_of_val(&features21) as u32,
                 )
+            } {
+                Ok(()) => features21.WorkGraphsTier,
+                Err(_) => Direct3D12::D3D12_WORK_GRAPHS_TIER_NOT_SUPPORTED,
             }
-            .is_ok()
-                && features21.WorkGraphsTier.0 >= Direct3D12::D3D12_WORK_GRAPHS_TIER_1_0.0
         };
+        let work_graphs_tier_supported =
+            work_graphs_tier.0 >= Direct3D12::D3D12_WORK_GRAPHS_TIER_1_0.0;
         let work_graphs_supported =
             work_graphs_tier_supported && shader_model >= naga::back::hlsl::ShaderModel::V6_8;
         if work_graphs_tier_supported && !work_graphs_supported {
@@ -728,6 +731,11 @@ impl super::Adapter {
         features.set(
             wgt::Features::EXPERIMENTAL_WORK_GRAPHS,
             work_graphs_supported,
+        );
+        features.set(
+            wgt::Features::EXPERIMENTAL_WORK_GRAPHS_1_1,
+            work_graphs_supported
+                && work_graphs_tier.0 >= super::work_graph_preview::D3D12_WORK_GRAPHS_TIER_1_1.0,
         );
         let shader_barycentrics_supported = {
             let mut features3 = Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();

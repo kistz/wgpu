@@ -486,6 +486,23 @@ pub enum CreatePipelineError {
     WorkGraphRequiresPassthroughModule,
     #[error("Work graph creation failed: {0}")]
     WorkGraph(String),
+    #[error("Work graph pipelines with mesh nodes require `max_input_records`")]
+    WorkGraphMissingMaxInputRecords,
+    #[error("Mesh node {node} is invalid")]
+    WorkGraphMeshNode {
+        node: usize,
+        #[source]
+        error: RenderError,
+    },
+    #[error("Mesh node {node} has topology {topology:?}, but mesh nodes require a list topology without a strip index format")]
+    WorkGraphMeshNodeTopology {
+        node: usize,
+        topology: wgt::PrimitiveTopology,
+    },
+    #[error(
+        "Mesh node {node} renders to different attachment formats or sample count than mesh node 0"
+    )]
+    WorkGraphMeshNodeTargetsMismatch { node: usize },
 }
 
 impl From<ColorAttachmentError> for CreatePipelineError {
@@ -584,7 +601,12 @@ impl WebGpuError for CreatePipelineError {
             Self::Internal { .. } => ErrorType::Internal,
             Self::PipelineConstants { .. } => ErrorType::Validation,
             Self::Render(e) => e.webgpu_error_type(),
-            Self::WorkGraphRequiresPassthroughModule | Self::WorkGraph(_) => ErrorType::Validation,
+            Self::WorkGraphMeshNode { error, .. } => error.webgpu_error_type(),
+            Self::WorkGraphRequiresPassthroughModule
+            | Self::WorkGraph(_)
+            | Self::WorkGraphMissingMaxInputRecords
+            | Self::WorkGraphMeshNodeTopology { .. }
+            | Self::WorkGraphMeshNodeTargetsMismatch { .. } => ErrorType::Validation,
         }
     }
 }
@@ -717,6 +739,54 @@ pub struct WorkGraphPipelineDescriptor<'a, PLL = Arc<PipelineLayout>, SM = Arc<S
     pub entrypoints: Cow<'a, [wgt::WorkGraphNodeId<'a>]>,
     /// Add all nodes in the shader library to the work graph.
     pub include_all_available_nodes: bool,
+    /// Mesh nodes of the work graph. A work graph with mesh nodes runs in a render pass.
+    pub mesh_nodes: Cow<'a, [WorkGraphMeshNodeDescriptor<'a>]>,
+    /// Upper bounds on the input of each dispatch. Required with mesh nodes.
+    pub max_input_records: Option<wgt::WorkGraphMaxInputRecords>,
+}
+
+/// Describes a mesh node of a work graph, and the graphics state that it draws with.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+/// cbindgen:ignore
+pub struct WorkGraphMeshNodeDescriptor<'a> {
+    /// The node's ID in the work graph.
+    pub node: wgt::WorkGraphNodeId<'a>,
+    /// Name of the mesh node shader in the shader library.
+    pub mesh_entry_point: Cow<'a, str>,
+    /// The fragment shader in the shader library and the color targets.
+    pub fragment: Option<WorkGraphFragmentState<'a>>,
+    /// The topology must match the output topology of the mesh node shader.
+    pub primitive: wgt::PrimitiveState,
+    pub depth_stencil: Option<wgt::DepthStencilState>,
+    pub multisample: wgt::MultisampleState,
+}
+
+impl WorkGraphMeshNodeDescriptor<'_> {
+    /// Returns a copy of this descriptor that owns its data.
+    pub fn into_owned(self) -> WorkGraphMeshNodeDescriptor<'static> {
+        WorkGraphMeshNodeDescriptor {
+            node: self.node.into_owned(),
+            mesh_entry_point: Cow::Owned(self.mesh_entry_point.into_owned()),
+            fragment: self.fragment.map(|fragment| WorkGraphFragmentState {
+                entry_point: Cow::Owned(fragment.entry_point.into_owned()),
+                targets: Cow::Owned(fragment.targets.into_owned()),
+            }),
+            primitive: self.primitive,
+            depth_stencil: self.depth_stencil,
+            multisample: self.multisample,
+        }
+    }
+}
+
+/// Describes the fragment shader of a work graph mesh node.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+/// cbindgen:ignore
+pub struct WorkGraphFragmentState<'a> {
+    /// Name of the fragment shader in the shader library.
+    pub entry_point: Cow<'a, str>,
+    pub targets: Cow<'a, [Option<wgt::ColorTargetState>]>,
 }
 
 #[derive(Debug)]
@@ -733,6 +803,11 @@ pub struct WorkGraphPipeline {
     pub(crate) late_sized_buffer_groups: ArrayVec<LateSizedBufferGroup, { hal::MAX_BIND_GROUPS }>,
     pub(crate) memory_requirements: wgt::WorkGraphMemoryRequirements,
     pub(crate) entrypoints: Vec<wgt::WorkGraphEntrypoint>,
+    pub(crate) max_input_records: Option<wgt::WorkGraphMaxInputRecords>,
+    /// The attachments that the mesh nodes render to, if there are mesh nodes.
+    pub(crate) pass_context: Option<RenderPassContext>,
+    /// Render pipeline flags of all mesh nodes.
+    pub(crate) flags: PipelineFlags,
     /// The `label` from the descriptor used to create the resource.
     pub(crate) label: String,
     pub(crate) tracking_data: TrackingData,
@@ -800,8 +875,15 @@ impl WorkGraphPipeline {
             late_sized_buffer_groups: ArrayVec::new(),
             memory_requirements: wgt::WorkGraphMemoryRequirements::default(),
             entrypoints: Vec::new(),
+            max_input_records: None,
+            pass_context: None,
+            flags: PipelineFlags::empty(),
             label,
         })
+    }
+
+    pub(crate) fn has_mesh_nodes(&self) -> bool {
+        self.pass_context.is_some()
     }
 
     /// Size requirements for the backing memory of this work graph.

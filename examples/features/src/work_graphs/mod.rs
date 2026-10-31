@@ -208,6 +208,8 @@ impl crate::framework::Example for Example {
             program_name: "fractals",
             entrypoints: &[],
             include_all_available_nodes: true,
+            mesh_nodes: &[],
+            max_input_records: None,
         });
         let entrypoint_index = graph
             .entrypoint_index(&wgpu::WorkGraphNodeId {

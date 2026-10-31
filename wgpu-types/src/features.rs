@@ -700,6 +700,23 @@ features! {
         #[name("wgpu-work-graphs")]
         const EXPERIMENTAL_WORK_GRAPHS = 1 << 25;
 
+        /// ***THIS IS EXPERIMENTAL:*** Features enabled by this may have
+        /// major bugs in them and are expected to be subject to breaking changes.
+        ///
+        /// Allows work graph pipelines to contain mesh nodes, which draw in a render pass.
+        ///
+        /// D3D12 only supports mesh nodes in preview Agility SDKs, and node shaders that use
+        /// `NodeLaunch("mesh")` need a DXC version with mesh node support.
+        ///
+        /// Requires [`Features::EXPERIMENTAL_WORK_GRAPHS`].
+        ///
+        /// Supported platforms:
+        /// - DX12 (work graphs tier 1.1)
+        ///
+        /// This is a native only feature.
+        #[name("wgpu-work-graphs-1-1")]
+        const EXPERIMENTAL_WORK_GRAPHS_1_1 = 1 << 35;
+
         /// Enables multiview render passes and `builtin(view_index)` in vertex/mesh shaders.
         ///
         /// Supported platforms:
@@ -1586,7 +1603,8 @@ impl Features {
                     | FeaturesWGPU::EXPERIMENTAL_RAY_HIT_VERTEX_RETURN.bits()
                     | FeaturesWGPU::EXPERIMENTAL_COOPERATIVE_MATRIX.bits()
                     | FeaturesWGPU::EXPERIMENTAL_RAY_TRACING_PIPELINES.bits()
-                    | FeaturesWGPU::EXPERIMENTAL_WORK_GRAPHS.bits(),
+                    | FeaturesWGPU::EXPERIMENTAL_WORK_GRAPHS.bits()
+                    | FeaturesWGPU::EXPERIMENTAL_WORK_GRAPHS_1_1.bits(),
             ),
             FeaturesWebGPU::empty(),
         )

@@ -11,6 +11,8 @@ use wgpu_test::{
     apply, gpu_test, GpuTestConfiguration, GpuTestInitializer, TestParameters, TestingContext,
 };
 
+mod mesh_nodes;
+
 pub fn all_tests(tests: &mut Vec<GpuTestInitializer>) {
     tests.extend([
         WORK_GRAPH_ENTRYPOINTS,
@@ -21,6 +23,7 @@ pub fn all_tests(tests: &mut Vec<GpuTestInitializer>) {
         WORK_GRAPH_GPU_INPUT,
         WORK_GRAPH_GPU_MULTI_NODE_INPUT,
         WORK_GRAPH_GPU_GENERATED_INPUT,
+        mesh_nodes::WORK_GRAPH_MESH_NODES,
     ]);
 }
 
@@ -152,6 +155,8 @@ impl Resources {
                 program_name,
                 entrypoints: &[],
                 include_all_available_nodes: true,
+                mesh_nodes: &[],
+                max_input_records: None,
             })
     }
 
