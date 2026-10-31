@@ -706,7 +706,7 @@ impl super::Adapter {
             wgt::Features::EXPERIMENTAL_MESH_SHADER,
             mesh_shader_supported,
         );
-        let work_graphs_supported = {
+        let work_graphs_tier_supported = {
             let mut features21 = Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS21::default();
             unsafe {
                 device.CheckFeatureSupport(
@@ -717,8 +717,14 @@ impl super::Adapter {
             }
             .is_ok()
                 && features21.WorkGraphsTier.0 >= Direct3D12::D3D12_WORK_GRAPHS_TIER_1_0.0
-                && shader_model >= naga::back::hlsl::ShaderModel::V6_8
         };
+        let work_graphs_supported =
+            work_graphs_tier_supported && shader_model >= naga::back::hlsl::ShaderModel::V6_8;
+        if work_graphs_tier_supported && !work_graphs_supported {
+            log::info!(
+                "Work graphs need shader model 6.8, but the device and shader compiler only support {shader_model:?}. Use a newer DXC compiler, for example with `WGPU_DX12_COMPILER`."
+            );
+        }
         features.set(
             wgt::Features::EXPERIMENTAL_WORK_GRAPHS,
             work_graphs_supported,

@@ -206,6 +206,7 @@ pub(crate) async fn get_adapter_with_capabilities_or_from_env(
         let adapters = instance.enumerate_adapters(Backends::all()).await;
 
         let mut chosen_adapter = None;
+        let mut rejected = Vec::new();
         for adapter in adapters {
             if let Some(surface) = surface {
                 if !adapter.is_surface_supported(surface) {
@@ -216,6 +217,13 @@ pub(crate) async fn get_adapter_with_capabilities_or_from_env(
             let required_features = *required_features;
             let adapter_features = adapter.features();
             if !adapter_features.contains(required_features) {
+                let info = adapter.get_info();
+                rejected.push(format!(
+                    "{} ({:?}): missing {}",
+                    info.name,
+                    info.backend,
+                    required_features - adapter_features
+                ));
                 continue;
             } else {
                 chosen_adapter = Some(adapter);
@@ -223,7 +231,15 @@ pub(crate) async fn get_adapter_with_capabilities_or_from_env(
             }
         }
 
-        chosen_adapter.expect("No suitable GPU adapters found on the system!")
+        chosen_adapter.unwrap_or_else(|| {
+            if rejected.is_empty() {
+                panic!("No suitable GPU adapters found on the system!");
+            }
+            panic!(
+                "No suitable GPU adapters found on the system. Adapters that lack features required by this example:\n{}\nRun with RUST_LOG=info to see why a feature is not exposed.",
+                rejected.join("\n")
+            )
+        })
     }
 }
 
