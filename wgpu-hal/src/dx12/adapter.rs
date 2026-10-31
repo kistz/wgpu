@@ -721,7 +721,7 @@ impl super::Adapter {
         let work_graphs_supported =
             work_graphs_tier_supported && shader_model >= naga::back::hlsl::ShaderModel::V6_8;
         if work_graphs_tier_supported && !work_graphs_supported {
-            log::info!(
+            log::warn!(
                 "Work graphs need shader model 6.8, but the device and shader compiler only support {shader_model:?}. Use a newer DXC compiler, for example with `WGPU_DX12_COMPILER`."
             );
         }
