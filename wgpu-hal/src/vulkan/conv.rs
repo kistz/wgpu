@@ -705,6 +705,10 @@ pub fn map_buffer_usage_to_barrier(
         stages |= vk::PipelineStageFlags::TRANSFER;
         access |= vk::AccessFlags::TRANSFER_WRITE;
     }
+    if usage.contains(wgt::BufferUses::WORK_GRAPH_BACKING_MEMORY) {
+        stages |= vk::PipelineStageFlags::COMPUTE_SHADER;
+        access |= vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE;
+    }
 
     (stages, access)
 }

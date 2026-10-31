@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::BufferAddress;
 
 /// Required alignment of the offset of a work graph's backing memory.
-pub const WORK_GRAPH_BACKING_MEMORY_ALIGNMENT: BufferAddress = 8;
+pub const WORK_GRAPH_BACKING_MEMORY_ALIGNMENT: BufferAddress = 64;
 
 /// Required alignment of the offset of work graph input in GPU memory.
 pub const WORK_GRAPH_GPU_INPUT_ALIGNMENT: BufferAddress = 8;
@@ -65,6 +65,11 @@ pub struct WorkGraphEntrypoint {
     pub record_size: u32,
     /// Required alignment of input records in bytes.
     pub record_alignment: u32,
+    /// The value of [`WorkGraphGpuNodeInput::gpu_input_index`] that refers to this entrypoint.
+    ///
+    /// This is the entrypoint index on DX12, and the node index that the driver assigns on
+    /// Vulkan.
+    pub gpu_input_index: u32,
 }
 
 impl WorkGraphEntrypoint {
@@ -130,8 +135,8 @@ impl WorkGraphGpuInputMode {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Pod, Zeroable)]
 pub struct WorkGraphGpuNodeInput {
-    /// Index of the entrypoint in the entrypoints of the work graph pipeline.
-    pub entrypoint_index: u32,
+    /// The [`WorkGraphEntrypoint::gpu_input_index`] of the entrypoint.
+    pub gpu_input_index: u32,
     /// Number of records to submit to the entrypoint.
     pub num_records: u32,
     /// GPU address of the first record.
@@ -141,8 +146,9 @@ pub struct WorkGraphGpuNodeInput {
     pub records_address: u64,
     /// Distance in bytes between the starts of consecutive records.
     ///
-    /// If this is zero, the first record is submitted `num_records` times. Otherwise it must be at
-    /// least the entrypoint's [`WorkGraphEntrypoint::record_size`].
+    /// If this is zero, the first record is submitted `num_records` times. Vulkan does not
+    /// support zero. Otherwise it must be at least the entrypoint's
+    /// [`WorkGraphEntrypoint::record_size`].
     pub record_stride: u64,
 }
 
@@ -170,8 +176,8 @@ pub struct WorkGraphGpuMultiNodeInput {
     pub node_inputs_address: u64,
     /// Distance in bytes between the starts of consecutive [`WorkGraphGpuNodeInput`]s.
     ///
-    /// If this is zero, the first node input is used `num_node_inputs` times. Otherwise it must
-    /// be at least the size of [`WorkGraphGpuNodeInput`].
+    /// If this is zero, the first node input is used `num_node_inputs` times. Vulkan does not
+    /// support zero. Otherwise it must be at least the size of [`WorkGraphGpuNodeInput`].
     pub node_inputs_stride: u64,
 }
 

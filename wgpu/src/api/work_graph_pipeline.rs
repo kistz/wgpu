@@ -2,8 +2,7 @@ use crate::*;
 
 /// Handle to a work graph pipeline.
 ///
-/// A `WorkGraphPipeline` is a graph of node shaders from a passthrough DXIL or HLSL shader
-/// library. It can be created with [`Device::create_work_graph_pipeline`] and is executed in a
+/// A `WorkGraphPipeline` is a graph of node shaders from a passthrough shader library. It can be created with [`Device::create_work_graph_pipeline`] and is executed in a
 /// [`ComputePass`] with [`ComputePass::set_work_graph_pipeline`] and
 /// [`ComputePass::dispatch_graph`]. A work graph with mesh nodes is executed in a [`RenderPass`]
 /// with [`RenderPass::set_work_graph_pipeline`] and [`RenderPass::dispatch_graph`] instead.
@@ -58,8 +57,9 @@ pub struct WorkGraphPipelineDescriptor<'a> {
     pub layout: &'a PipelineLayout,
     /// A shader module created with [`Device::create_shader_module_passthrough`] from a DXIL
     /// shader library, or from HLSL source that is compiled for a `lib_6_8` or newer target.
+    /// On Vulkan, the shader library is SPIR-V that uses `SPV_AMDX_shader_enqueue`.
     pub module: &'a ShaderModule,
-    /// Name of the work graph program.
+    /// Name of the work graph program. Vulkan ignores it.
     pub program_name: &'a str,
     /// Nodes that become entrypoints in addition to the ones the runtime determines from the
     /// shaders.

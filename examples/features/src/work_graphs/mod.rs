@@ -163,6 +163,7 @@ impl crate::framework::Example for Example {
             device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
                 label: Some("work graph library"),
                 hlsl: Some(Cow::Borrowed(include_str!("shader.hlsl"))),
+                spirv: Some(wgpu::util::make_spirv_raw(include_bytes!("shader.spv"))),
                 ..Default::default()
             })
         };

@@ -3,6 +3,9 @@
 //! The work graph in `shader.hlsl` has a broadcasting entry node that launches 4 threads per
 //! group of its dispatch grid. Each thread sends one record to a thread launch node, which adds
 //! the entry record's value to `output[dispatch thread id]`.
+//!
+//! `shader.spv` is compiled for Vulkan with
+//! `dxc -spirv -T lib_6_8 -fspv-target-env=vulkan1.3 shader.hlsl -Fo shader.spv`.
 
 use std::borrow::Cow;
 
@@ -61,12 +64,13 @@ fn gpu_buffer(ctx: &TestingContext, label: &str, contents: &[u8]) -> wgpu::Buffe
 
 /// GPU input for `num_records` entry records in `records`, starting at `offset`.
 fn gpu_node_input(
+    pipeline: &wgpu::WorkGraphPipeline,
     records: &wgpu::Buffer,
     offset: u64,
     num_records: u32,
 ) -> wgpu::WorkGraphGpuNodeInput {
     wgpu::WorkGraphGpuNodeInput {
-        entrypoint_index: 0,
+        gpu_input_index: pipeline.entrypoints()[0].gpu_input_index,
         num_records,
         records_address: records.work_graph_input_address() + offset,
         record_stride: 16,
@@ -88,6 +92,7 @@ impl Resources {
                 .create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
                     label: Some("work graph library"),
                     hlsl: Some(Cow::Borrowed(include_str!("shader.hlsl"))),
+                    spirv: Some(wgpu::util::make_spirv_raw(include_bytes!("shader.spv"))),
                     ..Default::default()
                 })
         };
@@ -345,7 +350,11 @@ static WORK_GRAPH_GPU_INPUT: GpuTestConfiguration = GpuTestConfiguration::new()
 
         let records = [entry_record(2, 1), entry_record(1, 10)];
         let records = gpu_buffer(&ctx, "records", bytemuck::cast_slice(&records));
-        let input = gpu_buffer(&ctx, "input", gpu_node_input(&records, 0, 2).as_bytes());
+        let input = gpu_buffer(
+            &ctx,
+            "input",
+            gpu_node_input(&pipeline, &records, 0, 2).as_bytes(),
+        );
 
         let mut encoder = ctx.device.create_command_encoder(&Default::default());
         {
@@ -376,8 +385,8 @@ static WORK_GRAPH_GPU_MULTI_NODE_INPUT: GpuTestConfiguration = GpuTestConfigurat
         let records = [entry_record(1, 1), entry_record(2, 16)];
         let records = gpu_buffer(&ctx, "records", bytemuck::cast_slice(&records));
         let node_inputs = [
-            gpu_node_input(&records, 0, 1),
-            gpu_node_input(&records, 16, 1),
+            gpu_node_input(&pipeline, &records, 0, 1),
+            gpu_node_input(&pipeline, &records, 16, 1),
         ];
         let node_inputs = gpu_buffer(&ctx, "node inputs", bytemuck::cast_slice(&node_inputs));
         let multi_node_input = wgpu::WorkGraphGpuMultiNodeInput::new(
@@ -432,7 +441,11 @@ static WORK_GRAPH_GPU_GENERATED_INPUT: GpuTestConfiguration = GpuTestConfigurati
         let backing_memory = resources.backing_memory(&ctx, &[&pipeline]);
 
         let records = gpu_buffer(&ctx, "records", &[0; 32]);
-        let input = gpu_buffer(&ctx, "input", gpu_node_input(&records, 0, 0).as_bytes());
+        let input = gpu_buffer(
+            &ctx,
+            "input",
+            gpu_node_input(&pipeline, &records, 0, 0).as_bytes(),
+        );
 
         let generator = ctx
             .device

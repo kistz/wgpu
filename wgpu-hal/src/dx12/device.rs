@@ -2594,6 +2594,7 @@ impl crate::Device for super::Device {
                     record_size: properties.GetEntrypointRecordSizeInBytes(graph_index, index),
                     record_alignment: properties
                         .GetEntrypointRecordAlignmentInBytes(graph_index, index),
+                    gpu_input_index: index,
                 }
             })
             .collect();

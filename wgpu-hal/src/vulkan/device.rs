@@ -1,4 +1,11 @@
-use alloc::{borrow::ToOwned as _, collections::BTreeMap, ffi::CString, sync::Arc, vec::Vec};
+use alloc::{
+    borrow::{Cow, ToOwned as _},
+    collections::BTreeMap,
+    ffi::CString,
+    string::String,
+    sync::Arc,
+    vec::Vec,
+};
 use core::{
     ffi::CStr,
     mem::{self, MaybeUninit},
@@ -700,6 +707,80 @@ impl super::Device {
         Ok(memory)
     }
 
+    /// Queries the backing memory requirements and entrypoints of a work graph pipeline.
+    unsafe fn work_graph_pipeline_info(
+        &self,
+        raw: vk::Pipeline,
+        nodes: &[super::work_graph::NodeShader],
+        names: &[CString],
+        graph: &super::work_graph::Graph,
+    ) -> Result<
+        (
+            Vec<super::WorkGraphEntrypoint>,
+            crate::WorkGraphPipelineInfo,
+        ),
+        crate::DeviceError,
+    > {
+        let functions = self.shared.extension_fns.shader_enqueue.as_ref().unwrap();
+        let scratch_size = unsafe { functions.get_execution_graph_pipeline_scratch_size(raw) }
+            .map_err(super::map_host_device_oom_err)?;
+
+        let mut entrypoints = graph
+            .entrypoints
+            .iter()
+            .map(|&node| {
+                let node_info = vk::PipelineShaderStageNodeCreateInfoAMDX::default()
+                    .name(&names[node])
+                    .index(nodes[node].index);
+                let node_index =
+                    unsafe { functions.get_execution_graph_pipeline_node_index(raw, &node_info) }
+                        .map_err(super::map_host_device_oom_err)?;
+                Ok((node_index, &nodes[node]))
+            })
+            .collect::<Result<Vec<_>, crate::DeviceError>>()?;
+        entrypoints.sort_by_key(|&(node_index, _)| node_index);
+
+        let input_alignment = self.shared.private_caps.work_graph_input_alignment;
+        let (entrypoints, info_entrypoints) = entrypoints
+            .into_iter()
+            .map(|(node_index, node)| {
+                let input = node.input.unwrap_or(super::work_graph::RecordLayout {
+                    size: 0,
+                    alignment: 1,
+                });
+                let record_alignment = input.alignment.max(input_alignment);
+                (
+                    super::WorkGraphEntrypoint {
+                        node_index,
+                        record_stride: u64::from(input.size)
+                            .next_multiple_of(u64::from(record_alignment)),
+                    },
+                    wgt::WorkGraphEntrypoint {
+                        node: wgt::WorkGraphNodeId {
+                            name: Cow::Owned(node.entry_point.clone()),
+                            array_index: node.index,
+                        },
+                        record_size: input.size,
+                        record_alignment,
+                        gpu_input_index: node_index,
+                    },
+                )
+            })
+            .unzip();
+
+        Ok((
+            entrypoints,
+            crate::WorkGraphPipelineInfo {
+                memory_requirements: wgt::WorkGraphMemoryRequirements {
+                    min_size: scratch_size.min_size,
+                    max_size: scratch_size.max_size,
+                    size_granularity: scratch_size.size_granularity,
+                },
+                entrypoints: info_entrypoints,
+            },
+        ))
+    }
+
     fn create_shader_module_impl(
         &self,
         spv: &[u32],
@@ -737,7 +818,9 @@ impl super::Device {
     ) -> Result<CompiledStage, crate::PipelineError> {
         let stage_flags = crate::auxil::map_naga_stage(naga_stage);
         let vk_module = match *stage.module {
-            super::ShaderModule::Raw(raw) => raw,
+            super::ShaderModule::Raw(raw) | super::ShaderModule::WorkGraphLibrary { raw, .. } => {
+                raw
+            }
             super::ShaderModule::Intermediate {
                 ref naga_shader,
                 runtime_checks,
@@ -837,7 +920,7 @@ impl super::Device {
             create_info,
             _entry_point: entry_point,
             temp_raw_module: match *stage.module {
-                super::ShaderModule::Raw(_) => None,
+                super::ShaderModule::Raw(_) | super::ShaderModule::WorkGraphLibrary { .. } => None,
                 super::ShaderModule::Intermediate { .. } => Some(vk_module),
             },
         })
@@ -1015,9 +1098,23 @@ impl crate::Device for super::Device {
         &self,
         desc: &crate::BufferDescriptor,
     ) -> Result<(super::Buffer, wgt::BufferAddress), crate::DeviceError> {
+        // Work graphs use storage buffers as backing memory and for input in GPU memory.
+        let work_graph_buffer = self
+            .shared
+            .features
+            .contains(wgt::Features::EXPERIMENTAL_WORK_GRAPHS)
+            && desc.usage.intersects(
+                wgt::BufferUses::STORAGE_READ_ONLY | wgt::BufferUses::STORAGE_READ_WRITE,
+            );
+        let mut usage = conv::map_buffer_usage(desc.usage);
+        if work_graph_buffer {
+            usage |= vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags::INDIRECT_BUFFER
+                | vk::BufferUsageFlags::EXECUTION_GRAPH_SCRATCH_AMDX;
+        }
         let vk_info = vk::BufferCreateInfo::default()
             .size(desc.size)
-            .usage(conv::map_buffer_usage(desc.usage))
+            .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
         let raw = unsafe {
@@ -1054,6 +1151,11 @@ impl crate::Device for super::Device {
             requirements.alignment = requirements
                 .alignment
                 .max(self.shared.private_caps.scratch_buffer_alignment as u64);
+        }
+        if work_graph_buffer {
+            requirements.alignment = requirements
+                .alignment
+                .max(wgt::WORK_GRAPH_BACKING_MEMORY_ALIGNMENT);
         }
 
         let allocation = self
@@ -1461,6 +1563,7 @@ impl crate::Device for super::Device {
             temp_texture_views: Default::default(),
             counters: Arc::clone(&self.counters),
             current_pipeline_is_multiview: false,
+            work_graph: None,
         })
     }
 
@@ -2057,6 +2160,18 @@ impl crate::Device for super::Device {
                 .map_err(|e| crate::ShaderError::Compilation(format!("{e}")))?;
                 super::ShaderModule::Raw(self.create_shader_module_impl(&spv, &desc.label)?)
             }
+            crate::ShaderInput::SpirV(data)
+                if self
+                    .shared
+                    .features
+                    .contains(wgt::Features::EXPERIMENTAL_WORK_GRAPHS)
+                    && super::work_graph::uses_shader_enqueue(data) =>
+            {
+                super::ShaderModule::WorkGraphLibrary {
+                    raw: self.create_shader_module_impl(data, &desc.label)?,
+                    spirv: data.into(),
+                }
+            }
             crate::ShaderInput::SpirV(data) => {
                 super::ShaderModule::Raw(self.create_shader_module_impl(data, &desc.label)?)
             }
@@ -2074,7 +2189,7 @@ impl crate::Device for super::Device {
 
     unsafe fn destroy_shader_module(&self, module: super::ShaderModule) {
         match module {
-            super::ShaderModule::Raw(raw) => {
+            super::ShaderModule::Raw(raw) | super::ShaderModule::WorkGraphLibrary { raw, .. } => {
                 unsafe { self.shared.raw.destroy_shader_module(raw, None) };
             }
             super::ShaderModule::Intermediate { .. } => {}
@@ -2623,18 +2738,97 @@ impl crate::Device for super::Device {
 
     unsafe fn create_work_graph_pipeline(
         &self,
-        _desc: &crate::WorkGraphPipelineDescriptor<super::PipelineLayout, super::ShaderModule>,
+        desc: &crate::WorkGraphPipelineDescriptor<super::PipelineLayout, super::ShaderModule>,
     ) -> Result<(super::WorkGraphPipeline, crate::WorkGraphPipelineInfo), crate::PipelineError>
     {
-        unimplemented!("Work graphs are unsupported on Vulkan")
+        let super::ShaderModule::WorkGraphLibrary {
+            raw: module,
+            ref spirv,
+        } = *desc.module
+        else {
+            return Err(crate::PipelineError::WorkGraph(String::from(
+                "Work graphs require a SPIR-V shader library with the ShaderEnqueueAMDX capability",
+            )));
+        };
+        if !desc.mesh_nodes.is_empty() {
+            return Err(crate::PipelineError::WorkGraph(String::from(
+                "Mesh nodes are not supported on Vulkan",
+            )));
+        }
+        let functions = self.shared.extension_fns.shader_enqueue.as_ref().unwrap();
+
+        let nodes =
+            super::work_graph::reflect_nodes(spirv).map_err(crate::PipelineError::WorkGraph)?;
+        let graph = super::work_graph::select_graph(
+            &nodes,
+            desc.entrypoints,
+            desc.include_all_available_nodes,
+        )
+        .map_err(crate::PipelineError::WorkGraph)?;
+        if graph.nodes.is_empty() {
+            return Err(crate::PipelineError::WorkGraph(String::from(
+                "The work graph has no nodes",
+            )));
+        }
+
+        // Entry point names from SPIR-V end at their first nul byte.
+        let names = nodes
+            .iter()
+            .map(|node| CString::new(node.entry_point.as_str()).unwrap())
+            .collect::<Vec<_>>();
+        let stages = graph
+            .nodes
+            .iter()
+            .map(|&node| {
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::COMPUTE)
+                    .module(module)
+                    .name(&names[node])
+            })
+            .collect::<Vec<_>>();
+        let create_info = vk::ExecutionGraphPipelineCreateInfoAMDX::default()
+            .stages(&stages)
+            .layout(desc.layout.raw);
+
+        let raw = {
+            profiling::scope!("vkCreateExecutionGraphPipelinesAMDX");
+            unsafe { functions.create_execution_graph_pipeline(&create_info) }
+                .map_err(super::map_pipeline_err)?
+        };
+
+        let info = unsafe { self.work_graph_pipeline_info(raw, &nodes, &names, &graph) };
+        let (entrypoints, info) = match info {
+            Ok(info) => info,
+            Err(error) => {
+                unsafe { self.shared.raw.destroy_pipeline(raw, None) };
+                return Err(error.into());
+            }
+        };
+
+        if let Some(label) = desc.label {
+            unsafe { self.shared.set_object_name(raw, label) };
+        }
+
+        self.counters.work_graph_pipelines.add(1);
+
+        Ok((
+            super::WorkGraphPipeline {
+                raw,
+                entrypoints: entrypoints.into(),
+            },
+            info,
+        ))
     }
 
-    unsafe fn destroy_work_graph_pipeline(&self, _pipeline: super::WorkGraphPipeline) {
-        unimplemented!("Work graphs are unsupported on Vulkan")
+    unsafe fn destroy_work_graph_pipeline(&self, pipeline: super::WorkGraphPipeline) {
+        unsafe { self.shared.raw.destroy_pipeline(pipeline.raw, None) };
+
+        self.counters.work_graph_pipelines.sub(1);
     }
 
-    unsafe fn get_buffer_device_address(&self, _buffer: &super::Buffer) -> wgt::BufferAddress {
-        unimplemented!("Work graphs are unsupported on Vulkan")
+    unsafe fn get_buffer_device_address(&self, buffer: &super::Buffer) -> wgt::BufferAddress {
+        let info = vk::BufferDeviceAddressInfo::default().buffer(buffer.raw);
+        unsafe { self.shared.raw.get_buffer_device_address(&info) }
     }
 
     unsafe fn create_pipeline_cache(

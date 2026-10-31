@@ -155,7 +155,7 @@ By @sagudev in [#10307](https://github.com/gfx-rs/wgpu/pull/10307).
 
 #### DX12
 
-- Add experimental work graph support with `Features::EXPERIMENTAL_WORK_GRAPHS`. Work graph pipelines are created from passthrough DXIL or HLSL shader libraries with `Device::create_work_graph_pipeline`, and run in a compute pass with `ComputePass::set_work_graph_pipeline` and `ComputePass::dispatch_graph`. `ComputePass::dispatch_graph_indirect` reads the input from GPU memory, which refers to records by `Buffer::work_graph_input_address`. With `Features::EXPERIMENTAL_WORK_GRAPHS_1_1`, work graphs can contain mesh nodes, which run in a render pass with `RenderPass::set_work_graph_pipeline` and `RenderPass::dispatch_graph`. DXIL passthrough shader modules may now have no entry points. By @kistz.
+- Add experimental work graph support with `Features::EXPERIMENTAL_WORK_GRAPHS`. Work graph pipelines are created from passthrough DXIL or HLSL shader libraries with `Device::create_work_graph_pipeline`, and run in a compute pass with `ComputePass::set_work_graph_pipeline` and `ComputePass::dispatch_graph`. `ComputePass::dispatch_graph_indirect` reads the input from GPU memory, which refers to records by `Buffer::work_graph_input_address`. With `Features::EXPERIMENTAL_WORK_GRAPHS_1_1`, work graphs can contain mesh nodes, which run in a render pass with `RenderPass::set_work_graph_pipeline` and `RenderPass::dispatch_graph`. On Vulkan, work graphs use `VK_AMDX_shader_enqueue` and passthrough SPIR-V shader libraries. DXIL passthrough shader modules may now have no entry points. By @kistz.
 
 #### Metal
 

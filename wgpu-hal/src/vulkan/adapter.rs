@@ -4,7 +4,10 @@ use core::{ffi::CStr, marker::PhantomData};
 use ash::{ext, google, khr, vk};
 use wgpu_sync::Mutex;
 
-use crate::{vulkan::semaphore_list::SemaphoreList, AllocationSizes};
+use crate::{
+    vulkan::{semaphore_list::SemaphoreList, shader_enqueue},
+    AllocationSizes,
+};
 
 use super::semaphore_list::SemaphoreListMode;
 
@@ -127,6 +130,16 @@ pub struct PhysicalDeviceFeatures {
     /// Features proved by `VK_EXT_mesh_shader`
     mesh_shader: Option<vk::PhysicalDeviceMeshShaderFeaturesEXT<'static>>,
 
+    /// Features provided by `VK_AMDX_shader_enqueue`.
+    shader_enqueue: Option<shader_enqueue::PhysicalDeviceShaderEnqueueFeatures>,
+
+    /// Features provided by `VK_KHR_maintenance5`, promoted to Vulkan 1.4.
+    ///
+    /// We only enable this for [`Features::EXPERIMENTAL_WORK_GRAPHS`], which requires it.
+    ///
+    /// [`Features::EXPERIMENTAL_WORK_GRAPHS`]: wgt::Features::EXPERIMENTAL_WORK_GRAPHS
+    maintenance5: Option<vk::PhysicalDeviceMaintenance5FeaturesKHR<'static>>,
+
     /// Features provided by `VK_KHR_shader_integer_dot_product`, promoted to Vulkan 1.3.
     shader_integer_dot_product:
         Option<vk::PhysicalDeviceShaderIntegerDotProductFeaturesKHR<'static>>,
@@ -217,6 +230,12 @@ impl PhysicalDeviceFeatures {
             info = info.push_next(feature);
         }
         if let Some(ref mut feature) = self.mesh_shader {
+            info = info.push_next(feature);
+        }
+        if let Some(ref mut feature) = self.shader_enqueue {
+            info = info.push_next(feature);
+        }
+        if let Some(ref mut feature) = self.maintenance5 {
             info = info.push_next(feature);
         }
         if let Some(ref mut feature) = self.shader_integer_dot_product {
@@ -575,6 +594,19 @@ impl PhysicalDeviceFeatures {
             {
                 let needed = requested_features.contains(wgt::Features::EXPERIMENTAL_MESH_SHADER);
                 Some(vk::PhysicalDeviceMaintenance4Features::default().maintenance4(needed))
+            } else {
+                None
+            },
+            shader_enqueue: if enabled_extensions.contains(&shader_enqueue::NAME) {
+                Some(shader_enqueue::PhysicalDeviceShaderEnqueueFeatures {
+                    shader_enqueue: vk::TRUE,
+                    ..Default::default()
+                })
+            } else {
+                None
+            },
+            maintenance5: if requested_features.contains(wgt::Features::EXPERIMENTAL_WORK_GRAPHS) {
+                Some(vk::PhysicalDeviceMaintenance5FeaturesKHR::default().maintenance5(true))
             } else {
                 None
             },
@@ -1075,6 +1107,26 @@ impl PhysicalDeviceFeatures {
             );
         }
 
+        // The GPU input of a work graph dispatch is aligned to `WORK_GRAPH_GPU_INPUT_ALIGNMENT`.
+        let supports_work_graphs = caps.supports_shader_enqueue()
+            && self
+                .shader_enqueue
+                .is_some_and(|features| features.shader_enqueue == vk::TRUE)
+            && caps.shader_enqueue.is_some_and(|properties| {
+                u64::from(properties.execution_graph_dispatch_address_alignment)
+                    <= wgt::WORK_GRAPH_GPU_INPUT_ALIGNMENT
+            });
+        features.set(F::EXPERIMENTAL_WORK_GRAPHS, supports_work_graphs);
+        if !supports_work_graphs && caps.supports_extension(shader_enqueue::NAME) {
+            log::warn!(
+                "Work graphs are unavailable, although the device supports {:?}. They need \
+                 revision {} of it, Vulkan 1.3, VK_KHR_maintenance5, VK_KHR_pipeline_library \
+                 and VK_KHR_buffer_device_address",
+                shader_enqueue::NAME,
+                shader_enqueue::SPEC_VERSION,
+            );
+        }
+
         // Not supported by default by `VK_KHR_portability_subset`, which we use on apple platforms.
         features.set(
             F::TEXTURE_COMPONENT_SWIZZLE,
@@ -1193,6 +1245,10 @@ pub struct PhysicalDeviceProperties {
     mesh_shader: Option<vk::PhysicalDeviceMeshShaderPropertiesEXT<'static>>,
 
     /// Additional `vk::PhysicalDevice` properties from the
+    /// `VK_AMDX_shader_enqueue` extension.
+    shader_enqueue: Option<shader_enqueue::PhysicalDeviceShaderEnqueueProperties>,
+
+    /// Additional `vk::PhysicalDevice` properties from the
     /// `VK_KHR_multiview` extension.
     multiview: Option<vk::PhysicalDeviceMultiviewPropertiesKHR<'static>>,
 
@@ -1225,6 +1281,20 @@ impl PhysicalDeviceProperties {
 
     pub fn is_driver(&self, id: vk::DriverId) -> bool {
         self.driver.is_some_and(|driver| driver.driver_id == id)
+    }
+
+    /// Returns `true` if the device supports revision 2 of `VK_AMDX_shader_enqueue` and the
+    /// extensions it depends on.
+    fn supports_shader_enqueue(&self) -> bool {
+        self.device_api_version >= vk::API_VERSION_1_3
+            && self.supported_extensions.iter().any(|extension| {
+                extension.extension_name_as_c_str() == Ok(shader_enqueue::NAME)
+                    && extension.spec_version >= shader_enqueue::SPEC_VERSION
+            })
+            && (self.device_api_version >= vk::make_api_version(0, 1, 4, 0)
+                || self.supports_extension(khr::maintenance5::NAME))
+            && self.supports_extension(khr::pipeline_library::NAME)
+            && self.supports_extension(khr::buffer_device_address::NAME)
     }
 
     /// Map `requested_features` to the list of Vulkan extension strings required to create the logical device.
@@ -1495,6 +1565,18 @@ impl PhysicalDeviceProperties {
         // Require `VK_KHR_cooperative_matrix` if the associated feature was requested
         if requested_features.contains(wgt::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
             extensions.push(khr::cooperative_matrix::NAME);
+        }
+
+        // Require `VK_AMDX_shader_enqueue` and its dependencies if work graphs were requested
+        if requested_features.contains(wgt::Features::EXPERIMENTAL_WORK_GRAPHS) {
+            extensions.push(shader_enqueue::NAME);
+            extensions.push(khr::pipeline_library::NAME);
+            if self.device_api_version < vk::make_api_version(0, 1, 4, 0) {
+                extensions.push(khr::maintenance5::NAME);
+            }
+            if !extensions.contains(&khr::buffer_device_address::NAME) {
+                extensions.push(khr::buffer_device_address::NAME);
+            }
         }
 
         extensions
@@ -1947,6 +2029,8 @@ impl super::InstanceShared {
 
                 let supports_mesh_shader = capabilities.supports_extension(ext::mesh_shader::NAME);
 
+                let supports_shader_enqueue = capabilities.supports_shader_enqueue();
+
                 let mut properties2 = vk::PhysicalDeviceProperties2KHR::default();
                 if supports_maintenance3 {
                     let next = capabilities
@@ -2029,6 +2113,13 @@ impl super::InstanceShared {
                     let next = capabilities
                         .mesh_shader
                         .insert(vk::PhysicalDeviceMeshShaderPropertiesEXT::default());
+                    properties2 = properties2.push_next(next);
+                }
+
+                if supports_shader_enqueue {
+                    let next = capabilities
+                        .shader_enqueue
+                        .insert(shader_enqueue::PhysicalDeviceShaderEnqueueProperties::default());
                     properties2 = properties2.push_next(next);
                 }
 
@@ -2219,6 +2310,13 @@ impl super::InstanceShared {
                 let next = features
                     .mesh_shader
                     .insert(vk::PhysicalDeviceMeshShaderFeaturesEXT::default());
+                features2 = features2.push_next(next);
+            }
+
+            if capabilities.supports_shader_enqueue() {
+                let next = features
+                    .shader_enqueue
+                    .insert(shader_enqueue::PhysicalDeviceShaderEnqueueFeatures::default());
                 features2 = features2.push_next(next);
             }
 
@@ -2531,6 +2629,12 @@ impl super::Instance {
                 .map(|maintenance_5| maintenance_5.depth_stencil_swizzle_one_support == vk::TRUE)
                 .unwrap_or(false),
             ray_tracing_pipeline_group_data_size: alignments.ray_tracing_pipeline_group_data_size,
+            max_work_graph_input_records: phd_capabilities.shader_enqueue.map_or(0, |properties| {
+                properties.max_execution_graph_shader_payload_count
+            }),
+            work_graph_input_alignment: phd_capabilities.shader_enqueue.map_or(0, |properties| {
+                properties.execution_graph_dispatch_address_alignment
+            }),
             store_op_none: phd_capabilities.device_api_version >= vk::API_VERSION_1_3
                 || (phd_capabilities.device_api_version >= vk::API_VERSION_1_2
                     && phd_capabilities.supports_extension(khr::dynamic_rendering::NAME))
@@ -2739,6 +2843,16 @@ impl super::Adapter {
                 &self.instance.raw,
                 &raw_device,
             ))
+        } else {
+            None
+        };
+        let shader_enqueue_fn = if enabled_extensions.contains(&shader_enqueue::NAME) {
+            let functions = shader_enqueue::DeviceFn::load(&self.instance.raw, &raw_device);
+            if functions.is_none() {
+                log::error!("The device lacks commands of VK_AMDX_shader_enqueue");
+                return Err(crate::DeviceError::Unexpected);
+            }
+            functions
         } else {
             None
         };
@@ -3014,6 +3128,7 @@ impl super::Adapter {
                 ray_tracing: ray_tracing_fns,
                 ray_tracing_pipelines: ray_tracing_pipeline_fns,
                 mesh_shading: mesh_shading_fns,
+                shader_enqueue: shader_enqueue_fn,
                 external_memory_fd: external_memory_fd_fn,
             },
             pipeline_cache_validation_key,

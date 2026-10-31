@@ -269,11 +269,11 @@ fn backing_memory_unaligned_offset() {
             encode_dispatch(
                 &device,
                 &pipeline,
-                buffer.slice(4..),
+                buffer.slice(8..),
                 &[input(0, 1, 0, &[0; 16])],
             )
         },
-        Some("is not a multiple of 8"),
+        Some("is not a multiple of 64"),
     );
 }
 

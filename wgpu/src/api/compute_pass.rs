@@ -159,8 +159,10 @@ impl ComputePass<'_> {
     ///
     /// - It must only refer to memory of `input_buffer` and `referenced_buffers`, and every
     ///   record it refers to must be complete.
-    /// - Entrypoint indices must be valid, and the addresses and strides must satisfy the
-    ///   requirements documented on [`WorkGraphGpuNodeInput`] and [`WorkGraphGpuMultiNodeInput`].
+    /// - Every [`WorkGraphGpuNodeInput::gpu_input_index`] must be the
+    ///   [`WorkGraphEntrypoint::gpu_input_index`] of an entrypoint, and the addresses and strides
+    ///   must satisfy the requirements documented on [`WorkGraphGpuNodeInput`] and
+    ///   [`WorkGraphGpuMultiNodeInput`].
     /// - The records must not violate limits declared by the nodes receiving them. For example,
     ///   an `SV_DispatchGrid` value must not exceed the node's `NodeMaxDispatchGrid`.
     pub unsafe fn dispatch_graph_indirect(

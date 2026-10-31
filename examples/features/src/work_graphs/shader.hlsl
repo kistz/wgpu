@@ -1,8 +1,10 @@
 // A work graph that draws a Koch snowflake and a Sierpinski carpet into `Canvas`.
 // Lines and squares are split further the closer they are to `Focus`.
 
+[[vk::binding(0)]] [[vk::image_format("rgba8")]]
 RWTexture2D<unorm float4> Canvas : register(u0);
 
+[[vk::binding(1)]]
 cbuffer Scene : register(b0)
 {
     float2 Focus;

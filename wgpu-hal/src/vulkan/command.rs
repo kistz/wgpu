@@ -1,8 +1,16 @@
 use super::conv;
+use alloc::{sync::Arc, vec, vec::Vec};
 use arrayvec::ArrayVec;
 use ash::vk;
 use core::{mem, ops::Range};
 use hashbrown::hash_map::Entry;
+
+// Work graph input in GPU memory has the layout of the Vulkan structures.
+const _: () = assert!(
+    size_of::<wgt::WorkGraphGpuNodeInput>() == size_of::<vk::DispatchGraphInfoAMDX>()
+        && size_of::<wgt::WorkGraphGpuMultiNodeInput>()
+            == size_of::<vk::DispatchGraphCountInfoAMDX>()
+);
 
 const ALLOCATION_GRANULARITY: u32 = 16;
 const DST_IMAGE_LAYOUT: vk::ImageLayout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
@@ -39,6 +47,11 @@ impl super::Texture {
 }
 
 impl super::CommandEncoder {
+    unsafe fn buffer_device_address(&self, buffer: &super::Buffer) -> vk::DeviceAddress {
+        let info = vk::BufferDeviceAddressInfo::default().buffer(buffer.raw);
+        unsafe { self.device.raw.get_buffer_device_address(&info) }
+    }
+
     fn write_pass_end_timestamp_if_requested(&mut self) {
         if let Some((query_set, index)) = self.end_of_pass_timer_query.take() {
             unsafe {
@@ -990,6 +1003,24 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 dynamic_offsets,
             )
         };
+        // Work graphs in compute passes share the bind groups of compute pipelines.
+        if self.bind_point == vk::PipelineBindPoint::COMPUTE
+            && self
+                .device
+                .features
+                .contains(wgt::Features::EXPERIMENTAL_WORK_GRAPHS)
+        {
+            unsafe {
+                self.device.raw.cmd_bind_descriptor_sets(
+                    self.active,
+                    vk::PipelineBindPoint::EXECUTION_GRAPH_AMDX,
+                    layout.raw,
+                    index,
+                    &sets,
+                    dynamic_offsets,
+                )
+            };
+        }
     }
     unsafe fn set_immediates(
         &mut self,
@@ -1408,12 +1439,160 @@ impl crate::CommandEncoder for super::CommandEncoder {
 
     // ray tracing
 
-    unsafe fn set_work_graph_pipeline(&mut self, _pipeline: &super::WorkGraphPipeline) {
-        unimplemented!()
+    unsafe fn set_work_graph_pipeline(&mut self, pipeline: &super::WorkGraphPipeline) {
+        unsafe {
+            self.device.raw.cmd_bind_pipeline(
+                self.active,
+                vk::PipelineBindPoint::EXECUTION_GRAPH_AMDX,
+                pipeline.raw,
+            )
+        };
+        self.work_graph = Some((pipeline.raw, Arc::clone(&pipeline.entrypoints)));
     }
 
-    unsafe fn dispatch_graph(&mut self, _desc: &crate::DispatchGraphDescriptor<super::Buffer>) {
-        unimplemented!()
+    unsafe fn dispatch_graph(&mut self, desc: &crate::DispatchGraphDescriptor<super::Buffer>) {
+        let functions = self.device.extension_fns.shader_enqueue.as_ref().unwrap();
+        let (pipeline, entrypoints) = self.work_graph.clone().unwrap();
+        let backing_memory = &desc.backing_memory;
+        let scratch =
+            unsafe { self.buffer_device_address(backing_memory.buffer) } + backing_memory.offset;
+
+        // Initialization and dispatches read and write the backing memory in the compute
+        // shader stage.
+        let barrier = |command_buffer| {
+            let barrier = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(backing_memory.buffer.raw)
+                .offset(backing_memory.offset)
+                .size(backing_memory.size);
+            unsafe {
+                self.device.raw.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[barrier],
+                    &[],
+                )
+            };
+        };
+        barrier(self.active);
+        if desc.initialize {
+            unsafe {
+                functions.cmd_initialize_graph_scratch_memory(
+                    self.active,
+                    pipeline,
+                    scratch,
+                    backing_memory.size,
+                )
+            };
+            barrier(self.active);
+        }
+
+        let inputs = match desc.inputs {
+            crate::DispatchGraphInputs::Cpu(inputs) => inputs,
+            crate::DispatchGraphInputs::Gpu {
+                buffer,
+                offset,
+                mode,
+            } => {
+                let address = unsafe { self.buffer_device_address(buffer) } + offset;
+                match mode {
+                    wgt::WorkGraphGpuInputMode::SingleNode => {
+                        let count_info = vk::DispatchGraphCountInfoAMDX {
+                            count: 1,
+                            infos: vk::DeviceOrHostAddressConstAMDX {
+                                device_address: address,
+                            },
+                            stride: size_of::<wgt::WorkGraphGpuNodeInput>() as u64,
+                        };
+                        unsafe {
+                            functions.cmd_dispatch_graph_indirect(
+                                self.active,
+                                scratch,
+                                backing_memory.size,
+                                &count_info,
+                            )
+                        };
+                    }
+                    wgt::WorkGraphGpuInputMode::MultiNode => unsafe {
+                        functions.cmd_dispatch_graph_indirect_count(
+                            self.active,
+                            scratch,
+                            backing_memory.size,
+                            address,
+                        )
+                    },
+                }
+                return;
+            }
+        };
+
+        // Vulkan reads `payloadCount * payloadStride` bytes of records and does not define a
+        // stride of zero, so the records are copied with a nonzero stride and padded.
+        let records = inputs
+            .iter()
+            .filter(|input| input.num_records != 0)
+            .map(|input| {
+                let entrypoint = &entrypoints[input.entrypoint_index as usize];
+                let stride = if input.record_stride == 0 {
+                    entrypoint.record_stride
+                } else {
+                    input.record_stride
+                };
+                let size = (u64::from(input.num_records) * stride) as usize;
+                let mut data = vec![0u64; size.div_ceil(8)];
+                let bytes = &mut bytemuck::cast_slice_mut::<u64, u8>(&mut data)[..size];
+                if input.record_stride != 0 {
+                    let len = input.records.len().min(size);
+                    bytes[..len].copy_from_slice(&input.records[..len]);
+                } else if stride != 0 {
+                    let len = input.records.len().min(stride as usize);
+                    for record in bytes.chunks_exact_mut(stride as usize) {
+                        record[..len].copy_from_slice(&input.records[..len]);
+                    }
+                }
+                (entrypoint.node_index, input.num_records, stride, data)
+            })
+            .collect::<Vec<_>>();
+
+        let max_records = self.device.private_caps.max_work_graph_input_records.max(1);
+        let infos = records
+            .iter()
+            .flat_map(|(node_index, num_records, stride, data)| {
+                let bytes = bytemuck::cast_slice::<u64, u8>(data);
+                (0..*num_records)
+                    .step_by(max_records as usize)
+                    .map(move |first| vk::DispatchGraphInfoAMDX {
+                        node_index: *node_index,
+                        payload_count: (num_records - first).min(max_records),
+                        payloads: vk::DeviceOrHostAddressConstAMDX {
+                            host_address: bytes[(u64::from(first) * stride) as usize..]
+                                .as_ptr()
+                                .cast(),
+                        },
+                        payload_stride: *stride,
+                    })
+            })
+            .collect::<Vec<_>>();
+        if infos.is_empty() {
+            return;
+        }
+
+        let count_info = vk::DispatchGraphCountInfoAMDX {
+            count: infos.len() as u32,
+            infos: vk::DeviceOrHostAddressConstAMDX {
+                host_address: infos.as_ptr().cast(),
+            },
+            stride: size_of::<vk::DispatchGraphInfoAMDX>() as u64,
+        };
+        unsafe {
+            functions.cmd_dispatch_graph(self.active, scratch, backing_memory.size, &count_info)
+        };
     }
 
     unsafe fn begin_ray_tracing_pass(&mut self, desc: &crate::RayTracingPassDescriptor<'_>) {

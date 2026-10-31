@@ -426,10 +426,12 @@ impl crate::Device for Context {
             entrypoints: desc
                 .entrypoints
                 .iter()
-                .map(|node| wgt::WorkGraphEntrypoint {
+                .zip(0..)
+                .map(|(node, index)| wgt::WorkGraphEntrypoint {
                     node: node.clone().into_owned(),
                     record_size: 16,
                     record_alignment: 4,
+                    gpu_input_index: index,
                 })
                 .collect(),
         };

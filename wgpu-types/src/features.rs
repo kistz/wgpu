@@ -687,14 +687,16 @@ features! {
         /// ***THIS IS EXPERIMENTAL:*** Features enabled by this may have
         /// major bugs in them and are expected to be subject to breaking changes.
         ///
-        /// Allows creating work graph pipelines from passthrough DXIL or HLSL shader libraries,
-        /// and dispatching them in a compute pass.
+        /// Allows creating work graph pipelines from passthrough shader libraries, and
+        /// dispatching them in a compute pass. The libraries are DXIL or HLSL on DX12, and
+        /// SPIR-V that uses `SPV_AMDX_shader_enqueue` on Vulkan.
         ///
         /// Work graph shaders can only be supplied as passthrough shaders, so this also
         /// requires [`Features::PASSTHROUGH_SHADERS`].
         ///
         /// Supported platforms:
         /// - DX12 (work graphs tier 1.0 and shader model 6.8)
+        /// - Vulkan (revision 2 of the provisional `VK_AMDX_shader_enqueue` extension)
         ///
         /// This is a native only feature.
         #[name("wgpu-work-graphs")]

@@ -35,7 +35,9 @@ mod memory;
 mod pnext_chain;
 mod sampler;
 mod semaphore_list;
+mod shader_enqueue;
 mod swapchain;
+mod work_graph;
 
 pub use adapter::PhysicalDeviceFeatures;
 pub(crate) use pnext_chain::PnextChain;
@@ -416,6 +418,7 @@ struct DeviceExtensionFunctions {
     ray_tracing: Option<RayTracingDeviceExtensionFunctions>,
     ray_tracing_pipelines: Option<khr::ray_tracing_pipeline::Device>,
     mesh_shading: Option<ext::mesh_shader::Device>,
+    shader_enqueue: Option<shader_enqueue::DeviceFn>,
     #[cfg_attr(not(unix), allow(dead_code))]
     external_memory_fd: Option<khr::external_memory_fd::Device>,
 }
@@ -521,6 +524,12 @@ struct PrivateCapabilities {
     /// The data size parameter is just this * the group count, so we store this to not
     /// require an unnecessary parameter.
     ray_tracing_pipeline_group_data_size: u32,
+
+    /// The maximum number of input records of one node in a work graph dispatch.
+    max_work_graph_input_records: u32,
+
+    /// Required alignment of the input of a work graph dispatch in GPU memory.
+    work_graph_input_alignment: u32,
 
     /// Whether `VK_ATTACHMENT_STORE_OP_NONE` is supported. This includes:
     /// - `VK_ATTACHMENT_STORE_OP_NONE` provided by `VK_VERSION_1_3`.
@@ -1223,6 +1232,9 @@ pub struct CommandEncoder {
     counters: Arc<wgt::HalCounters>,
 
     current_pipeline_is_multiview: bool,
+
+    /// The work graph pipeline set by `set_work_graph_pipeline` and its entrypoints.
+    work_graph: Option<(vk::Pipeline, Arc<[WorkGraphEntrypoint]>)>,
 }
 
 impl Drop for CommandEncoder {
@@ -1283,6 +1295,11 @@ impl crate::DynCommandBuffer for CommandBuffer {}
 #[derive(Debug)]
 pub enum ShaderModule {
     Raw(vk::ShaderModule),
+    /// A passthrough module with work graph nodes, which keeps its SPIR-V for reflection.
+    WorkGraphLibrary {
+        raw: vk::ShaderModule,
+        spirv: Box<[u32]>,
+    },
     Intermediate {
         naga_shader: crate::NagaShader,
         runtime_checks: wgt::ShaderRuntimeChecks,
@@ -1314,7 +1331,17 @@ pub struct RayTracingPipeline {
 impl crate::DynRayTracingPipeline for RayTracingPipeline {}
 
 #[derive(Debug)]
-pub struct WorkGraphPipeline {}
+pub struct WorkGraphPipeline {
+    raw: vk::Pipeline,
+    entrypoints: Arc<[WorkGraphEntrypoint]>,
+}
+
+#[derive(Debug)]
+struct WorkGraphEntrypoint {
+    node_index: u32,
+    /// Size of an input record rounded up to its alignment.
+    record_stride: u64,
+}
 
 impl crate::DynWorkGraphPipeline for WorkGraphPipeline {}
 
